@@ -4,7 +4,7 @@ AI coding assistants sometimes finish with a summary that says more than they di
 
 jev-no-bullshit checks each final summary against what the assistant actually did. If the summary bullshits, the assistant is sent back to check its work and say plainly what it did, what it verified, and what is unfinished.
 
-It works with **Claude Code** and **Codex**. The check is done by [Jev](https://typesafe.ai), a fast yes/no model from TypeSafe.
+It works with **Claude Code** and **Codex**. The check is done by [Jev](https://typesafe.ai), a yes/no model from TypeSafe.
 
 ## What you need
 
@@ -85,9 +85,9 @@ Every check is logged. To see the latest one:
 tail -n 1 ~/.jev-no-bullshit/log.jsonl
 ```
 
-If a line says `"error": "TYPESAFE_API_KEY is not set"`, the assistant can't see your key. Set it as in step 1 and restart the assistant from a new terminal.
+If a line says `"error": "TYPESAFE_API_KEY is not set"`, the assistant can't see your key. Set it as in step 1 and restart the assistant from a new terminal. If you start Claude Code some other way than from a terminal, see [Other ways to set the key](#other-ways-to-set-the-key).
 
-If something goes wrong (no key, no network, Jev is slow), jev-no-bullshit steps aside and lets the assistant finish normally. It never blocks your work.
+If jev-no-bullshit itself runs into a problem (no key, no network, Jev takes more than 10 seconds), it logs the problem and lets the assistant finish normally. A problem with the check never holds up your work.
 
 ### Privacy
 
