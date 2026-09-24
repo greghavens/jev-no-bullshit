@@ -133,7 +133,7 @@ codex plugin remove jev-no-bullshit@jev-no-bullshit
 pi remove git:github.com/greghavens/jev-no-bullshit
 ```
 
-**opencode**: delete the `jev-no-bullshit@…` line from `plugin` in `~/.config/opencode/opencode.json`.
+**opencode**: delete the `jev-no-bullshit@…` line from `plugin` in `~/.config/opencode/opencode.jsonc` (or `opencode.json`, whichever you have).
 
 ---
 

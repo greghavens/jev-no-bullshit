@@ -216,8 +216,10 @@ class PiE2E(_E2EBase):
         super().tearDown()
 
     def test_plugin_installs_and_redirects_once(self):
-        self.run_cli([PI_BIN, "install", str(REPO)])
-        self.assertIn(str(REPO), self.run_cli([PI_BIN, "list"]).stdout)
+        # PI_PACKAGE_SOURCE checks an install source as the README gives it, e.g. git:github.com/<owner>/jev-no-bullshit.
+        source = os.environ.get("PI_PACKAGE_SOURCE", str(REPO))
+        self.run_cli([PI_BIN, "install", source])
+        self.assertIn(source, self.run_cli([PI_BIN, "list"]).stdout)
 
         # Print mode: the feedback continues the same run, so its final text is the revision.
         proc = self.run_cli([PI_BIN, "--print", "--no-session", "--model", "mock/claude-mock", TASK])
