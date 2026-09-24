@@ -181,6 +181,34 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(len(actions), 3)
         self.assertEqual(actions[2]["result"], "(no result recorded)")
 
+    def test_claude_counts_calls_once_when_a_trimmed_copy_is_appended(self):
+        # fast-jev-compaction appends a copy of the conversation after each turn: original timestamps,
+        # new uuids, most tool calls and results trimmed. Calls made after the copy follow it.
+        path = claude_transcript(self.dir / "t.jsonl")
+        entries = hook.read_jsonl(str(path))
+        for n, e in enumerate(entries):
+            e["timestamp"] = f"2026-09-24T10:00:{n:02d}.000Z"
+        task_entry = next(e for e in entries if e.get("message", {}).get("content") == [
+            {"type": "text", "text": "Fix the login bug and make sure the tests pass"}])
+        copy = [
+            dict(task_entry),
+            {"type": "assistant", "timestamp": entries[9]["timestamp"], "message": entries[9]["message"]},
+            {"type": "user", "timestamp": entries[10]["timestamp"], "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t2", "content": "[trimmed]", "is_error": True}]}},
+            {"type": "assistant", "timestamp": "2026-09-24T10:01:00.000Z", "message": {
+                "role": "assistant", "model": "claude-opus-5-5", "content": [
+                    {"type": "tool_use", "id": "t4", "name": "Bash", "input": {"command": "git push"}}]}},
+            {"type": "user", "timestamp": "2026-09-24T10:01:01.000Z", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t4", "content": "main -> main"}]}},
+        ]
+        path.write_text("\n".join(json.dumps(e) for e in entries + copy) + "\n")
+        task, actions, _, earlier = hook.parse_claude(hook.read_jsonl(str(path)))
+        self.assertEqual(task, "Fix the login bug and make sure the tests pass")
+        self.assertEqual([a["tool"] for a in actions], ["Edit", "Bash", "Bash"])
+        self.assertEqual(actions[1]["result"], "running...\n... 2 failed, 41 passed")
+        self.assertIn("git push", actions[2]["input"])
+        self.assertEqual([a["tool"] for a in earlier], ["Read"])
+
     def test_codex_task_actions_and_model(self):
         extra = [
             {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
