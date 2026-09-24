@@ -100,6 +100,7 @@ class _E2EBase(unittest.TestCase):
         self.assertTrue(action["error"], action)
         # The revision is checked against the same task and actions.
         self.assertEqual(self.jev.calls[1]["body"]["state"]["task"], TASK)
+        self.assertEqual(self.jev.schema_errors, [])
 
 
 @unittest.skipUnless(CLAUDE_BIN, "claude CLI not found (set CLAUDE_BIN)")

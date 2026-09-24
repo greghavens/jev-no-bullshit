@@ -77,13 +77,57 @@ class _MockServer:
         self.server.server_close()
 
 
+def systemone_request_errors(body) -> list[dict]:
+    """Check a request body against SystemOneRequest in TypeSafe's OpenAPI schema.
+
+    Mirrors the wire models generated from https://api.typesafe.ai/openapi.json in typesafe-sdk 0.7.1
+    (typesafe_sdk/_schemas/models.py). Returns FastAPI-style `detail` entries, empty if the body is valid.
+    """
+    json_content = (str, dict, list)
+    errors = []
+
+    def err(loc, msg):
+        errors.append({"loc": ["body", *loc], "msg": msg, "type": "value_error"})
+
+    if not isinstance(body, dict):
+        err([], "request body must be a JSON object")
+        return errors
+    for key in set(body) - {"state", "model", "questions"}:
+        err([key], "extra fields not permitted")
+    if not isinstance(body.get("state"), json_content):
+        err(["state"], "state must be a string, object or array")
+    if not isinstance(body.get("model"), str) or not body["model"]:
+        err(["model"], "model must be a nonempty string")
+    questions = body.get("questions")
+    if not isinstance(questions, dict) or not questions:
+        err(["questions"], "questions must be a nonempty object")
+        return errors
+    for name, question in questions.items():
+        if not isinstance(question, dict) or question.get("type") != "noul":
+            err(["questions", name, "type"], 'this stand-in only answers type "noul"')
+            continue
+        for key in set(question) - {"type", "instructions", "criteria"}:
+            err(["questions", name, key], "extra fields not permitted")
+        if question.get("instructions") is not None and not isinstance(question["instructions"], json_content):
+            err(["questions", name, "instructions"], "instructions must be a string, object or array")
+        criteria = question.get("criteria")
+        if criteria is not None and (not isinstance(criteria, dict) or set(criteria) - {"true", "false"}):
+            err(["questions", name, "criteria"], 'criteria may only have "true" and "false"')
+    return errors
+
+
 class MockJev(_MockServer):
-    """POST /v1/systemone. `answer(qid, body) -> float` decides each noul."""
+    """POST /v1/systemone. `answer(qid, body) -> float` decides each noul.
+
+    Rejects any request that doesn't match TypeSafe's SystemOneRequest schema with a 422, as the real API
+    does, and answers in the SystemOneResponse shape (model, answers keyed by question name, usage).
+    """
 
     def __init__(self):
         self.answer = lambda qid, body: 0.0
         self.status = 200
         self.delay = 0.0
+        self.schema_errors = []
         super().__init__()
 
     @property
@@ -94,6 +138,14 @@ class MockJev(_MockServer):
         time.sleep(self.delay)
         if self.status != 200:
             self.send_json(handler, self.status, {"detail": "boom"})
+            return
+        errors = systemone_request_errors(body)
+        if method != "POST" or path != "/v1/systemone":
+            self.send_json(handler, 404, {"detail": "Not Found"})
+            return
+        if errors:
+            self.schema_errors.append(errors)
+            self.send_json(handler, 422, {"detail": errors})
             return
         self.send_json(handler, 200, {
             "model": "jev-2026-09-15",

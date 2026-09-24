@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mocks import MockJev  # noqa: E402
+from mocks import MockJev, systemone_request_errors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parent.parent / "jev-no-bullshit"
 
@@ -327,6 +327,9 @@ class HookRunTests(unittest.TestCase):
         request = self.jev.calls[0]
         self.assertEqual(request["path"], "/v1/systemone")
         self.assertEqual(request["headers"]["Authorization"], "Bearer test-key")
+        self.assertEqual(request["headers"]["Content-Type"], "application/json")
+        self.assertEqual(request["headers"]["Accept"], "application/json")
+        self.assertEqual(self.jev.schema_errors, [])
         body = request["body"]
         self.assertEqual(body["model"], "jev-latest")
         self.assertEqual(body["state"]["task"], "Fix the login bug and make sure the tests pass")
@@ -427,6 +430,12 @@ class HookRunTests(unittest.TestCase):
         self.assertIsNone(self.run_hook())
         self.assertIn("HTTP 500", self.log_lines()[-1]["error"])
 
+    def test_fails_open_on_schema_rejection(self):
+        # The stand-in answers 422 like the real API; the hook logs the server's message and lets the turn end.
+        self.env["TYPESAFE_BASE_URL"] = self.jev.url + "/wrong-prefix"
+        self.assertIsNone(self.run_hook())
+        self.assertIn("HTTP 404", self.log_lines()[-1]["error"])
+
     def test_fails_open_on_bad_input(self):
         proc = subprocess.run([sys.executable, str(SCRIPT)], input="not json", capture_output=True, text=True, env=self.env)
         self.assertEqual((proc.returncode, proc.stdout), (0, ""))
@@ -453,3 +462,33 @@ class HookRunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# The Jev stand-in enforces TypeSafe's request schema, so the tests above would catch a wrong request.
+
+
+class SystemOneSchemaTests(unittest.TestCase):
+    def valid(self):
+        return {"state": {"task": "t"}, "model": "jev-latest", "questions": {"q": {"type": "noul", "instructions": "Is it?"}}}
+
+    def test_hook_request_shape_is_valid(self):
+        state, _ = hook.build_state("Fix it", [{"tool": "Bash", "input": "npm test", "result": "ok", "error": False}], "Done. It works.")
+        questions, _ = hook.build_questions(state)
+        body = {"state": state, "model": hook.JEV_MODEL, "questions": questions}
+        self.assertEqual(systemone_request_errors(json.loads(json.dumps(body))), [])
+
+    def test_rejects_bad_requests(self):
+        self.assertEqual(systemone_request_errors(self.valid()), [])
+        bad = [
+            {k: v for k, v in self.valid().items() if k != "state"},
+            {**self.valid(), "model": ""},
+            {**self.valid(), "questions": {}},
+            {**self.valid(), "extra": 1},
+            {**self.valid(), "questions": {"q": {"type": "noul", "prompt": "Is it?"}}},
+            {**self.valid(), "questions": {"q": {"type": "noul", "criteria": {"yes": "x"}}}},
+            {**self.valid(), "state": 3},
+        ]
+        for body in bad:
+            with self.subTest(body=body):
+                self.assertNotEqual(systemone_request_errors(body), [])
