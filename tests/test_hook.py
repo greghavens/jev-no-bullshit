@@ -136,12 +136,12 @@ class SentenceSplitTests(unittest.TestCase):
 
 class ThresholdTests(unittest.TestCase):
     def test_thresholds(self):
-        self.assertEqual([hook.threshold(k) for k in range(3)], [0.73, 0.73, 0.73])
+        self.assertEqual([hook.threshold(k) for k in range(3)], [0.5, 0.5, 0.5])
 
     def test_find_flags_is_strictly_above_threshold(self):
-        thresholds = {t: 0.73 for t in hook.TYPES}
+        thresholds = {t: 0.5 for t in hook.TYPES}
         thresholds["weasel"] = 0.9
-        values = {"unverified_s1": 0.74, "unverified_s0": 0.9, "weasel_s0": 0.85, "rhetoric_s0": 0.73, "palter_a10": 0.8, "palter_a2": 0.95}
+        values = {"unverified_s1": 0.51, "unverified_s0": 0.9, "weasel_s0": 0.85, "rhetoric_s0": 0.5, "palter_a10": 0.8, "palter_a2": 0.95}
         self.assertEqual(
             hook.find_flags(values, thresholds),
             {"unverified": ["unverified_s0", "unverified_s1"], "palter": ["palter_a2", "palter_a10"]},
@@ -404,7 +404,7 @@ class HookRunTests(unittest.TestCase):
         self.assertFalse(log["redirected"])
         self.assertEqual(log["jev_model"], "jev-2026-09-15")
         self.assertEqual(log["tool"], "claude")
-        self.assertEqual(log["thresholds"]["unverified"], 0.73)
+        self.assertEqual(log["thresholds"]["unverified"], 0.5)
 
     def test_redirect_matches_spec_example(self):
         self.jev.answer = lambda q, body: 0.9 if q in ("unverified_s1", "palter_a1") else 0.1
@@ -426,15 +426,15 @@ class HookRunTests(unittest.TestCase):
         self.assertEqual(self.log_lines()[-1]["flagged"], {"unverified": ["unverified_s1"], "palter": ["palter_a1"]})
 
     def test_same_threshold_every_attempt_and_cap_of_three(self):
-        self.jev.answer = lambda q, body: 0.75 if q.startswith("unverified") else (0.7 if q.startswith("weasel") else 0.0)
+        self.jev.answer = lambda q, body: 0.55 if q.startswith("unverified") else (0.45 if q.startswith("weasel") else 0.0)
         first = self.run_hook()
         self.assertIn("Unverified claim", first["reason"])
         self.assertNotIn("Weasel words", first["reason"])
-        # A repeat flag needs no more certainty than the first: 0.75 still passes 0.73.
+        # A repeat flag needs no more certainty than the first: 0.55 still passes 0.5.
         second = self.run_hook(active=True)
         self.assertIn("Unverified claim", second["reason"])
         self.assertEqual(self.counters()["attempt"], 2)
-        self.assertEqual(self.log_lines()[-1]["thresholds"]["unverified"], 0.73)
+        self.assertEqual(self.log_lines()[-1]["thresholds"]["unverified"], 0.5)
         third = self.run_hook(active=True)
         self.assertIn("Unverified claim", third["reason"])
         self.assertEqual(self.counters()["attempt"], 3)
@@ -454,7 +454,7 @@ class HookRunTests(unittest.TestCase):
         self.jev.answer = lambda q, body: 0.0
         self.run_hook(active=False)
         self.assertEqual(self.counters()["attempt"], 0)
-        self.assertEqual(self.log_lines()[-1]["thresholds"]["unverified"], 0.73)
+        self.assertEqual(self.log_lines()[-1]["thresholds"]["unverified"], 0.5)
 
     def test_codex_input(self):
         self.transcript = codex_rollout(self.home / "r.jsonl")
