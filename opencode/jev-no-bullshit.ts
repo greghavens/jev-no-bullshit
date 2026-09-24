@@ -10,8 +10,11 @@ import type { Plugin } from "@opencode-ai/plugin"
 const SCRIPT = fileURLToPath(new URL("../jev-no-bullshit", import.meta.url))
 // The script's feedback starts with this tag, so a prompt that does is ours.
 const TAG = "[jev-no-bullshit]"
-// Redirects per prompt from the person, whatever the script says.
-const MAX_REDIRECTS = 3
+// Redirects per message from the person: JEV_NO_BULLSHIT_MAX_REDIRECTS, a whole number of at least 1, or 1.
+function maxRedirects(value: string | undefined): number {
+  const n = Number(value)
+  return Number.isInteger(n) && n >= 1 ? n : 1
+}
 const TIMEOUT_MS = 30_000
 
 type Part = { type: string; text?: string; synthetic?: boolean; tool?: string; callID?: string; state?: any }
@@ -77,7 +80,7 @@ export const JevNoBullshit: Plugin = async ({ client }) => {
     const redirects = messages
       .slice(taskIndex + 1)
       .filter((m) => m.info.role === "user" && text(m.parts).trim().startsWith(TAG)).length
-    if (redirects >= MAX_REDIRECTS) return
+    if (redirects >= maxRedirects(process.env.JEV_NO_BULLSHIT_MAX_REDIRECTS)) return
 
     const calls = (from: number, to: number) =>
       messages

@@ -6,7 +6,7 @@ const FEEDBACK = "[jev-no-bullshit] Double-check these before you finish: ..."
 // Stands in for the engine: runs the checker script by handing out the next
 // verdict, and records what the plugin submits, the environment each check
 // ran with, and the order of checks and Stop hooks.
-function engine(on: any, verdicts: (string | undefined)[], opts: { stopBlocks?: string } = {}) {
+function engine(on: any, verdicts: (string | undefined)[], opts: { stopBlocks?: string; env?: Record<string, string> } = {}) {
   const submitted: { text: string; context?: string[] }[] = []
   const envs: Record<string, string>[] = []
   const order: string[] = []
@@ -17,6 +17,7 @@ function engine(on: any, verdicts: (string | undefined)[], opts: { stopBlocks?: 
     return { value: { exitCode: 0, stderr: "", stdout: reason ? JSON.stringify({ decision: "block", reason }) : "" } }
   })
   on("ui.log", () => ({ value: undefined }))
+  on("env.get", (_$: any, e: any) => ({ value: opts.env?.[e.name] }))
   on("prompt.submit", (_$: any, e: any) => {
     if (e.text.startsWith("[jev-no-bullshit]")) submitted.push({ text: e.text, context: e.context })
     return { text: e.text }
@@ -96,13 +97,22 @@ test("the checker is told which turns are redirects, by environment", async ($, 
   expect(envs.every((env) => env.JEV_NO_BULLSHIT_MODULE === "1")).toBe(true)
 })
 
-test("at most 3 redirects per prompt, and every reply is still checked so the plain Stop hook stands down", async ($, on) => {
+test("at most 1 redirect per prompt by default, and every reply is still checked so the plain Stop hook stands down", async ($, on) => {
   const { submitted, envs, order } = engine(on, Array(10).fill(FEEDBACK))
+  for (let i = 0; i < 4; i++) {
+    await stop($, `reply ${i}`)
+    await endTurn($, `reply ${i}`)
+  }
+  expect(submitted.length).toBe(1)
+  expect(envs.length).toBe(4)
+  expect(order.filter((o) => o === "check").length).toBe(4)
+})
+
+test("JEV_NO_BULLSHIT_MAX_REDIRECTS raises the limit", async ($, on) => {
+  const { submitted } = engine(on, Array(10).fill(FEEDBACK), { env: { JEV_NO_BULLSHIT_MAX_REDIRECTS: "3" } })
   for (let i = 0; i < 6; i++) {
     await stop($, `reply ${i}`)
     await endTurn($, `reply ${i}`)
   }
   expect(submitted.length).toBe(3)
-  expect(envs.length).toBe(6)
-  expect(order.filter((o) => o === "check").length).toBe(6)
 })

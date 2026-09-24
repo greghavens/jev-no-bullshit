@@ -77,7 +77,7 @@ Each time the assistant finishes, its summary is checked. If the summary is hone
 Then rewrite your summary plainly: what you did, what you verified and how, and what failed or is unfinished.
 ```
 
-The assistant checks its work and writes a new summary, which is checked the same way. It's sent back at most 3 times per request, so it never gets stuck, and each sentence or action is called out only once per request.
+The assistant checks its work and writes a new summary, which is checked the same way. By default it's sent back only once per request, and each sentence or action is called out only once per request.
 
 Where you see the note:
 
@@ -166,7 +166,17 @@ By default, once a sentence or action has been called out, it isn't called out a
 export JEV_NO_BULLSHIT_MAX_CALLOUTS=2
 ```
 
-It must be a whole number of at least 1; any other value is treated as 1. The limit of 3 redirects per request still applies.
+It must be a whole number of at least 1; any other value is treated as 1. The limit on send-backs per request still applies.
+
+### Send the assistant back more than once
+
+By default the assistant is sent back at most once per request, so its revised summary is the last word. To allow more rounds, set `JEV_NO_BULLSHIT_MAX_REDIRECTS` the same way, for example:
+
+```sh
+export JEV_NO_BULLSHIT_MAX_REDIRECTS=3
+```
+
+It must be a whole number of at least 1; any other value is treated as 1.
 
 ### Other ways to set the key
 

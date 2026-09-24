@@ -40,7 +40,9 @@ JEV_TIMEOUT_SECONDS = 10.0
 TRANSCRIPT_WAIT_SECONDS = 3.0
 NO_RESULT = "(no result recorded)"
 
-MAX_REDIRECTS = 3
+# How many times the model may be sent back per prompt. It almost always answers the first note
+# properly, and each further round buries the summary the person asked for.
+DEFAULT_MAX_REDIRECTS = 1
 # How many times the same sentence or action may be called out per prompt. A revision that names a
 # failure and then answers a later note without repeating it gets the failure flagged again.
 DEFAULT_MAX_CALLOUTS = 1
@@ -239,17 +241,25 @@ def log(entry: dict) -> None:
         print(f"jev-no-bullshit: cannot write log ({error}): {json.dumps(entry)}", file=sys.stderr)
 
 
-def max_callouts() -> int:
-    """JEV_NO_BULLSHIT_MAX_CALLOUTS, or the default when it is unset or not a whole number of at least 1."""
+def positive_setting(name: str, default: int) -> int:
+    """The environment variable as a whole number of at least 1, or the default."""
     try:
-        value = int(os.environ.get("JEV_NO_BULLSHIT_MAX_CALLOUTS", ""))
+        value = int(os.environ.get(name, ""))
     except ValueError:
-        return DEFAULT_MAX_CALLOUTS
-    return value if value >= 1 else DEFAULT_MAX_CALLOUTS
+        return default
+    return value if value >= 1 else default
+
+
+def max_callouts() -> int:
+    return positive_setting("JEV_NO_BULLSHIT_MAX_CALLOUTS", DEFAULT_MAX_CALLOUTS)
+
+
+def max_redirects() -> int:
+    return positive_setting("JEV_NO_BULLSHIT_MAX_REDIRECTS", DEFAULT_MAX_REDIRECTS)
 
 
 def threshold(times_flagged: int) -> float:
-    """The same bar on every attempt; MAX_REDIRECTS is what ends a run of redirects."""
+    """The same bar on every attempt; max_redirects() is what ends a run of redirects."""
     return BASE_THRESHOLD
 
 
@@ -1041,7 +1051,7 @@ def run(hook_input: dict) -> dict | None:
     # Answers without a numeric noul are ignored; log them, or an API change would silently flag nothing.
     unanswered = sorted(set(questions) - set(values))
     flagged, repeats = drop_repeats(find_flags(values, thresholds), state, counters["callouts"], max_callouts())
-    capped = bool(flagged) and counters["attempt"] >= MAX_REDIRECTS
+    capped = bool(flagged) and counters["attempt"] >= max_redirects()
     redirect = bool(flagged) and not capped
     log(
         {

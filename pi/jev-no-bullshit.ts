@@ -11,8 +11,11 @@ const SCRIPT = fileURLToPath(new URL("../jev-no-bullshit", import.meta.url))
 // The script's feedback starts with this tag.
 const TAG = "[jev-no-bullshit]"
 const CUSTOM_TYPE = "jev-no-bullshit"
-// Redirects per message from the person, whatever the script says.
-const MAX_REDIRECTS = 3
+// Redirects per message from the person: JEV_NO_BULLSHIT_MAX_REDIRECTS, a whole number of at least 1, or 1.
+function maxRedirects(value: string | undefined): number {
+  const n = Number(value)
+  return Number.isInteger(n) && n >= 1 ? n : 1
+}
 const TIMEOUT_MS = 30_000
 
 type Call = { tool: string; input: unknown; result: string | null; error: boolean; now: boolean }
@@ -59,7 +62,7 @@ export default function (pi: ExtensionAPI) {
     const redirects = messages
       .slice(taskIndex + 1)
       .filter((m) => (m as { role: string; customType?: string }).role === "custom" && (m as { customType?: string }).customType === CUSTOM_TYPE).length
-    if (redirects >= MAX_REDIRECTS) return
+    if (redirects >= maxRedirects(process.env.JEV_NO_BULLSHIT_MAX_REDIRECTS)) return
 
     const last = messages[messages.length - 1] as { role: string; content?: unknown; model?: string }
     if (last?.role !== "assistant") return

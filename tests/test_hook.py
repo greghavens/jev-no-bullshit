@@ -461,9 +461,24 @@ class HookRunTests(unittest.TestCase):
         self.assertEqual(self.counters()["flags"]["weasel"], 0)
         self.assertEqual(self.log_lines()[-1]["flagged"], {"unverified": ["unverified_s1"], "palter": ["palter_a1"]})
 
-    def test_same_threshold_every_attempt_and_cap_of_three(self):
+    def test_one_redirect_by_default(self):
+        self.jev.answer = lambda q, body: 0.9 if q.startswith("unverified") else 0.0
+        self.assertIn("All tests are passing", self.run_hook(summary="All tests are passing.")["reason"])
+        # The revision makes a new claim, but one redirect has happened already.
+        self.assertIsNone(self.run_hook(active=True, summary="The deploy finished."))
+        log = self.log_lines()[-1]
+        self.assertTrue(log["capped"])
+        self.assertFalse(log["redirected"])
+        for bad in ("0", "-1", "two", ""):
+            with self.subTest(value=bad):
+                self.env["JEV_NO_BULLSHIT_MAX_REDIRECTS"] = bad
+                self.run_hook(summary="All tests are passing.")
+                self.assertIsNone(self.run_hook(active=True, summary="The deploy finished."))
+
+    def test_same_threshold_every_attempt_and_max_redirects_setting(self):
         # The same claims every time: allow them to be called out more than once, so only the cap ends the run.
         self.env["JEV_NO_BULLSHIT_MAX_CALLOUTS"] = "5"
+        self.env["JEV_NO_BULLSHIT_MAX_REDIRECTS"] = "3"
         self.jev.answer = lambda q, body: 0.65 if q.startswith("unverified") else (0.55 if q.startswith("weasel") else 0.0)
         first = self.run_hook()
         self.assertIn("Unverified claim", first["reason"])
@@ -485,6 +500,7 @@ class HookRunTests(unittest.TestCase):
         self.assertEqual(len(self.jev.calls), 4)
 
     def test_fresh_turn_resets_counters(self):
+        self.env["JEV_NO_BULLSHIT_MAX_REDIRECTS"] = "3"
         self.jev.answer = lambda q, body: 0.9
         self.run_hook()
         self.run_hook(active=True, summary="Rewrote the login check.")
@@ -496,6 +512,7 @@ class HookRunTests(unittest.TestCase):
         self.assertEqual(self.log_lines()[-1]["thresholds"]["unverified"], 0.6)
 
     def test_same_sentence_is_called_out_once(self):
+        self.env["JEV_NO_BULLSHIT_MAX_REDIRECTS"] = "3"
         self.jev.answer = lambda q, body: 0.9 if q.startswith("unverified") else 0.0
         self.assertIn("All tests are passing", self.run_hook(summary="All tests are passing.")["reason"])
         # The revision repeats the flagged sentence and adds a new one: only the new one is called out.
@@ -516,6 +533,7 @@ class HookRunTests(unittest.TestCase):
     def test_max_callouts_setting(self):
         self.jev.answer = lambda q, body: 0.9 if q.startswith("unverified") else 0.0
         self.env["JEV_NO_BULLSHIT_MAX_CALLOUTS"] = "2"
+        self.env["JEV_NO_BULLSHIT_MAX_REDIRECTS"] = "3"
         self.run_hook()
         self.assertIn("All tests are passing", self.run_hook(active=True)["reason"])
         self.assertIsNone(self.run_hook(active=True))

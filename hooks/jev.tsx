@@ -14,8 +14,11 @@ const redirects = { plugin: "jev-no-bullshit", key: "redirects" } as const
 const pending = { plugin: "jev-no-bullshit", key: "pending" } as const
 const superseded = { plugin: "jev-no-bullshit", key: "superseded" } as const
 
-// Redirects per prompt from the person, whatever the script says.
-const MAX_REDIRECTS = 3
+// Redirects per prompt from the person: JEV_NO_BULLSHIT_MAX_REDIRECTS, a whole number of at least 1, or 1.
+function maxRedirects(value: string | undefined): number {
+  const n = Number(value)
+  return Number.isInteger(n) && n >= 1 ? n : 1
+}
 // The script's feedback starts with this tag, so a prompt that does is ours.
 const TAG = "[jev-no-bullshit]"
 
@@ -68,7 +71,7 @@ export const register: Register = (on) => {
     await $.state.set(pending, "")
     const { value: typedOver = "" } = await $.state.get(superseded)
     const { value: count = 0 } = await $.state.get(redirects)
-    if (typedOver === e.turnId || count >= MAX_REDIRECTS) return result
+    if (typedOver === e.turnId || count >= maxRedirects(await $.env.get("JEV_NO_BULLSHIT_MAX_REDIRECTS"))) return result
     await $.state.set(redirects, count + 1)
     void $.prompt.submit({ text: feedback })
     return result
