@@ -49,18 +49,7 @@ That's it.
 
 There's nothing to run. Work as usual.
 
-Each time the assistant finishes, jev-no-bullshit checks its summary. If the summary is honest, you won't see anything.
-
-If it isn't, what you see depends on the tool:
-
-- **Claude Code**: the flagged reply stays on screen. The plugin then sends the note below to the assistant as a prompt of its own, so you see exactly what was flagged, and the assistant revises. Claude Code labels that prompt as coming from the plugin. If you type a message while the assistant is still working, the plugin drops the note for that reply rather than send it after your message.
-- **Codex**, and Claude Code where plugin hook modules aren't enabled (see below): the assistant is stopped from finishing, and you'll see a line like this:
-
-  ```
-  Asking claude-opus-5-5 to reconsider its response after bullshit detection, attempt #1
-  ```
-
-The assistant then gets a note that quotes exactly what was wrong, for example:
+Each time the assistant finishes, its summary is checked. If the summary is honest, you won't see anything. If it isn't, the assistant gets a note that quotes what was wrong, for example:
 
 ```
 [jev-no-bullshit] Double-check these before you finish:
@@ -69,11 +58,12 @@ The assistant then gets a note that quotes exactly what was wrong, for example:
 Then rewrite your summary plainly: what you did, what you verified and how, and what failed or is unfinished.
 ```
 
-It checks its work and writes a new summary, which is checked the same way. The assistant is sent back at most 3 times per answer, so it never gets stuck.
+The assistant checks its work and writes a new summary, which is checked the same way. It's sent back at most 3 times per request, so it never gets stuck.
 
-### Hook modules in Claude Code
+Where you see the note:
 
-The prompt-and-revise behavior uses Claude Code's plugin hook modules, which are in early access. Claude Code turns them on through a rollout flag, which stays off with a third-party model provider (Bedrock, Vertex, a custom `ANTHROPIC_BASE_URL`), with nonessential traffic disabled, or on accounts the rollout hasn't reached. Set `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` to turn them on anyway. Without them the plugin falls back to a plain Stop hook: replies are still checked, and Claude Code shows the note as "Stop hook feedback", under a "Stop hook error" row.
+- **Claude Code**: below the flagged reply, as a prompt that Claude Code labels as coming from the plugin. If you type a message while the assistant is still working, the note is dropped.
+- **Codex**: as Stop hook feedback, after a line like `Asking gpt-6-astra to reconsider its response after bullshit detection, attempt #1`.
 
 ### What gets flagged
 
@@ -132,6 +122,10 @@ Then add the Stop hook yourself:
 - **Codex**: merge [examples/codex-hooks.json](examples/codex-hooks.json) into `~/.codex/hooks.json`, then approve it with `/hooks`.
 
 Use this or the plugin, not both. With both, every check runs twice.
+
+### If Claude Code shows "Stop hook error"
+
+Showing the note as a prompt uses Claude Code's plugin hook modules, which are in early access. They stay off with a third-party model provider (Bedrock, Vertex, a custom `ANTHROPIC_BASE_URL`), with nonessential traffic disabled, or on accounts the rollout hasn't reached. Set `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` to turn them on anyway. Without them, replies are still checked, but Claude Code shows the note as "Stop hook feedback" under a "Stop hook error" row.
 
 ### Other ways to set the key
 
