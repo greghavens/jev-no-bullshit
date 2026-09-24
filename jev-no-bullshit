@@ -460,8 +460,12 @@ def parse_claude(entries: list[dict]) -> tuple[str, list[dict], str | None, list
 
     actions are the tool calls since the task message; earlier actions are the ones before it, which
     back up what the summary says about previous turns.
+
+    A plugin may append a trimmed copy of the conversation to the transcript (fast-jev-compaction
+    does, after every turn), with the original timestamps and fewer tool calls. So each tool call is
+    counted once, by its ID, and the turn is found by timestamp rather than by place in the file.
     """
-    task_index, task = -1, ""
+    task_index, task, task_time = -1, "", ""
     for i, e in enumerate(entries):
         if e.get("type") != "user" or e.get("isMeta") or e.get("isSidechain") or e.get("isCompactSummary"):
             continue
@@ -469,8 +473,12 @@ def parse_claude(entries: list[dict]) -> tuple[str, list[dict], str | None, list
         if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
             continue
         text = content_text(content)
-        if is_real_user_text(text):
-            task_index, task = i, text.strip()
+        if is_real_user_text(text) and str(e.get("timestamp") or "") >= task_time:
+            task_index, task, task_time = i, text.strip(), str(e.get("timestamp") or "")
+
+    def is_now(n: int, e: dict) -> bool:
+        stamp = str(e.get("timestamp") or "")
+        return stamp > task_time if stamp and task_time else n > task_index
 
     calls: list[dict] = []
     by_id: dict[str, dict] = {}
@@ -481,11 +489,13 @@ def parse_claude(entries: list[dict]) -> tuple[str, list[dict], str | None, list
         message = e.get("message") or {}
         content = message.get("content")
         if e.get("type") == "assistant":
-            if n > task_index and message.get("model") and message["model"] != "<synthetic>":
+            if is_now(n, e) and message.get("model") and message["model"] != "<synthetic>":
                 model = message["model"]
             for block in content if isinstance(content, list) else []:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
-                    call = {"tool": block.get("name"), "input": block.get("input"), "result": None, "error": False, "now": n > task_index}
+                    if block.get("id") in by_id:
+                        continue  # a copy of a call already seen
+                    call = {"tool": block.get("name"), "input": block.get("input"), "result": None, "error": False, "now": is_now(n, e), "time": str(e.get("timestamp") or "")}
                     calls.append(call)
                     if block.get("id"):
                         by_id[block["id"]] = call
@@ -493,9 +503,11 @@ def parse_claude(entries: list[dict]) -> tuple[str, list[dict], str | None, list
             for block in content if isinstance(content, list) else []:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     call = by_id.get(block.get("tool_use_id"))
-                    if call is not None:
+                    if call is not None and call["result"] is None:  # a copy's result may be trimmed
                         call["result"] = content_text(block.get("content"))
                         call["error"] = bool(block.get("is_error"))
+    if all(c["time"] for c in calls):
+        calls.sort(key=lambda c: c["time"])  # a call made after a copy may sit before the copy's calls
     if model is None:  # the model may be named only before the task message
         for e in reversed(entries[: task_index + 1]):
             m = (e.get("message") or {}).get("model") if e.get("type") == "assistant" else None
