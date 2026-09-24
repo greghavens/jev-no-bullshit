@@ -6,11 +6,54 @@ The design is in [docs/jev-no-bullshit-spec.md](docs/jev-no-bullshit-spec.md).
 
 ## Install
 
-It is one Python script with no dependencies (tested on Python 3.10 to 3.13).
+This repo is a plugin marketplace that both Claude Code and Codex can install from. The plugin adds one Stop hook, which runs `python3 jev-no-bullshit` from the installed copy. You need `python3` on your PATH and a TypeSafe API key (see [API key](#api-key)).
+
+### Claude Code
+
+In Claude Code:
+
+```
+/plugin marketplace add greghavens/jev-no-bullshit
+/plugin install jev-no-bullshit@jev-no-bullshit
+```
+
+Or from a shell:
 
 ```sh
-install -m 0755 jev-no-bullshit ~/.local/bin/jev-no-bullshit   # any directory on your PATH
+claude plugin marketplace add greghavens/jev-no-bullshit
+claude plugin install jev-no-bullshit@jev-no-bullshit
 ```
+
+The hook is active from the next session. It needs Claude Code v2.1.196 or later, for `last_assistant_message`.
+
+### Codex
+
+```sh
+codex plugin marketplace add greghavens/jev-no-bullshit
+codex plugin add jev-no-bullshit@jev-no-bullshit
+```
+
+Codex does not run a plugin's hooks until you trust them. Start `codex`, run `/hooks`, and approve the `jev-no-bullshit` Stop hook. You approve it again if the hook changes in an update.
+
+### Uninstall
+
+```sh
+claude plugin uninstall jev-no-bullshit@jev-no-bullshit
+codex plugin remove jev-no-bullshit@jev-no-bullshit
+```
+
+### Without the plugin system
+
+Copy the script onto your PATH and add the Stop hook yourself:
+
+```sh
+install -m 0755 jev-no-bullshit ~/.local/bin/jev-no-bullshit
+```
+
+- **Claude Code**: merge [examples/claude-settings.json](examples/claude-settings.json) into `~/.claude/settings.json` (user) or `.claude/settings.json` (project).
+- **Codex**: merge [examples/codex-hooks.json](examples/codex-hooks.json) into `~/.codex/hooks.json` or `<repo>/.codex/hooks.json`, then approve it once with `/hooks`.
+
+Use only one of the two methods. With both, the hook runs twice per stop.
 
 ## API key
 
@@ -40,7 +83,10 @@ Summaries, tool inputs and tool results (clipped to about 2,000 characters each)
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests
+python3 -m unittest discover -s tests -v
 ```
 
-The tests run the script against Claude Code and Codex transcript fixtures and a local mock of `POST /v1/systemone`. They make no network calls.
+- `tests/test_hook.py` runs the script against Claude Code and Codex transcript fixtures and a local mock of TypeSafe's `POST /v1/systemone`.
+- `tests/test_e2e.py` installs this repo as a plugin into the real `claude` and `codex` CLIs, using throwaway config directories. It then runs one headless turn per CLI against local mocks of the Anthropic Messages API, the OpenAI Responses API and TypeSafe. The scripted model runs a failing command and then claims "All tests pass." The test checks that the hook saw the real transcript, redirected once, and let the corrected answer end the turn. Each test is skipped when its CLI is not installed. Set `CLAUDE_BIN` or `CODEX_BIN` to use a specific binary. The Codex test passes `--dangerously-bypass-hook-trust` in place of the `/hooks` approval.
+
+None of the tests use the network or real credentials. CI (`.github/workflows/test.yml`) runs everything against pinned CLI versions.

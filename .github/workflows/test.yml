@@ -1,0 +1,31 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # The end-to-end tests install the plugin into these CLIs. They are pinned to the versions
+      # the tests were written against; bump them deliberately.
+      - name: Install Claude Code and Codex
+        run: npm install -g @anthropic-ai/claude-code@2.1.281 @openai/codex@0.156.1
+      - name: Validate plugin manifests
+        run: |
+          claude plugin validate --strict .
+          claude plugin validate --strict .claude-plugin/plugin.json
+      - name: Unit and end-to-end tests
+        run: python -m unittest discover -s tests -v

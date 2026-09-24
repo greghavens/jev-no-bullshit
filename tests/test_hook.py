@@ -7,11 +7,11 @@ import os
 import subprocess
 import sys
 import tempfile
-import threading
-import time
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mocks import MockJev  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parent.parent / "jev-no-bullshit"
 
@@ -92,50 +92,6 @@ def codex_rollout(path: Path, extra=()):
     ]
     path.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
     return path
-
-
-class MockJev:
-    """A local stand-in for POST /v1/systemone. `answer(qid) -> float` decides each noul."""
-
-    def __init__(self):
-        self.requests = []
-        self.answer = lambda qid: 0.0
-        self.status = 200
-        self.delay = 0.0
-        mock = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                mock.requests.append({"path": self.path, "headers": dict(self.headers), "body": body})
-                time.sleep(mock.delay)
-                if mock.status != 200:
-                    payload = json.dumps({"detail": "boom"}).encode()
-                else:
-                    payload = json.dumps({
-                        "model": "jev-2026-09-15",
-                        "answers": {q: {"type": "noul", "noul": mock.answer(q)} for q in body["questions"]},
-                        "usage": {"input_tokens": 100, "output_tokens": 5},
-                    }).encode()
-                self.send_response(mock.status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                try:
-                    self.wfile.write(payload)
-                except BrokenPipeError:
-                    pass  # the client gave up (timeout test)
-
-            def log_message(self, *args):
-                pass
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-
-    def close(self):
-        self.server.shutdown()
-        self.server.server_close()
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +285,7 @@ class HookRunTests(unittest.TestCase):
 
     def test_clean_summary_lets_turn_end(self):
         self.assertIsNone(self.run_hook())
-        request = self.jev.requests[0]
+        request = self.jev.calls[0]
         self.assertEqual(request["path"], "/v1/systemone")
         self.assertEqual(request["headers"]["Authorization"], "Bearer test-key")
         body = request["body"]
@@ -351,7 +307,7 @@ class HookRunTests(unittest.TestCase):
         self.assertEqual(log["thresholds"]["unverified"], 0.5)
 
     def test_redirect_matches_spec_example(self):
-        self.jev.answer = lambda q: 0.9 if q in ("unverified_s1", "palter_a1") else 0.1
+        self.jev.answer = lambda q, body: 0.9 if q in ("unverified_s1", "palter_a1") else 0.1
         output = self.run_hook()
         self.assertEqual(output["decision"], "block")
         self.assertEqual(
@@ -373,7 +329,7 @@ class HookRunTests(unittest.TestCase):
         self.assertEqual(self.log_lines()[-1]["flagged"], {"unverified": ["unverified_s1"], "palter": ["palter_a1"]})
 
     def test_backoff_per_type_and_cap_of_three(self):
-        self.jev.answer = lambda q: 0.8 if q.startswith("unverified") else (0.6 if q.startswith("weasel") else 0.0)
+        self.jev.answer = lambda q, body: 0.8 if q.startswith("unverified") else (0.6 if q.startswith("weasel") else 0.0)
         first = self.run_hook()
         self.assertIn("Unverified claim", first["reason"])
         self.assertIn("Weasel words", first["reason"])
@@ -383,31 +339,31 @@ class HookRunTests(unittest.TestCase):
         self.assertNotIn("Weasel words", second["reason"])
         self.assertTrue(second["systemMessage"].endswith("attempt #2"))
         # Third check: unverified needs > 0.875 now.
-        self.jev.answer = lambda q: 0.9 if q.startswith("unverified") else 0.0
+        self.jev.answer = lambda q, body: 0.9 if q.startswith("unverified") else 0.0
         third = self.run_hook(active=True)
         self.assertTrue(third["systemMessage"].endswith("attempt #3"))
         # Fourth check: flagged again, but 3 redirects already happened.
-        self.jev.answer = lambda q: 0.99
+        self.jev.answer = lambda q, body: 0.99
         self.assertIsNone(self.run_hook(active=True))
         log = self.log_lines()[-1]
         self.assertTrue(log["capped"])
         self.assertFalse(log["redirected"])
         self.assertEqual(log["attempt"], 3)
-        self.assertEqual(len(self.jev.requests), 4)
+        self.assertEqual(len(self.jev.calls), 4)
 
     def test_fresh_turn_resets_counters(self):
-        self.jev.answer = lambda q: 0.9
+        self.jev.answer = lambda q, body: 0.9
         self.run_hook()
         self.run_hook(active=True)
         self.assertEqual(self.counters()["attempt"], 2)
-        self.jev.answer = lambda q: 0.0
+        self.jev.answer = lambda q, body: 0.0
         self.run_hook(active=False)
         self.assertEqual(self.counters()["attempt"], 0)
         self.assertEqual(self.log_lines()[-1]["thresholds"]["unverified"], 0.5)
 
     def test_codex_input(self):
         self.transcript = codex_rollout(self.home / "r.jsonl")
-        self.jev.answer = lambda q: 0.9 if q == "palter_a1" else 0.0
+        self.jev.answer = lambda q, body: 0.9 if q == "palter_a1" else 0.0
         output = self.run_hook(turn_id="turn-1", model="gpt-5.5-codex", summary="Fixed it.")
         self.assertEqual(
             output["systemMessage"], "Asking gpt-5.5-codex to reconsider its response after bullshit detection, attempt #1"
@@ -417,14 +373,14 @@ class HookRunTests(unittest.TestCase):
 
     def test_model_fallback(self):
         self.transcript = self.home / "missing.jsonl"
-        self.jev.answer = lambda q: 0.9
+        self.jev.answer = lambda q, body: 0.9
         output = self.run_hook()
         self.assertTrue(output["systemMessage"].startswith("Asking the model to reconsider"))
 
     def test_fails_open_without_api_key(self):
         del self.env["TYPESAFE_API_KEY"]
         self.assertIsNone(self.run_hook())
-        self.assertEqual(self.jev.requests, [])
+        self.assertEqual(self.jev.calls, [])
         self.assertIn("TYPESAFE_API_KEY", self.log_lines()[-1]["error"])
 
     def test_fails_open_on_http_error(self):

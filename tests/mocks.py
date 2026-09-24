@@ -1,0 +1,216 @@
+"""Local HTTP stand-ins for the TypeSafe API and the model APIs used by the tests."""
+
+import json
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+MARKER = "[jev-no-bullshit]"
+
+
+class _QuietServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        if not isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError)):
+            super().handle_error(request, client_address)  # clients closing keep-alive sockets are normal
+
+
+class _MockServer:
+    """Base class: records every request and routes it to `self.respond(handler, path, body)`."""
+
+    def __init__(self):
+        self.requests = []
+        mock = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _handle(self, method):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw) if raw else None
+                except ValueError:
+                    body = None
+                mock.requests.append({"method": method, "path": self.path, "headers": dict(self.headers), "body": body})
+                try:
+                    mock.respond(self, method, self.path, body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # the client gave up (timeout tests)
+
+            def do_POST(self):
+                self._handle("POST")
+
+            def do_GET(self):
+                self._handle("GET")
+
+            def log_message(self, *args):
+                pass
+
+        self.server = _QuietServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    @staticmethod
+    def send_json(handler, status, payload):
+        data = json.dumps(payload).encode()
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
+
+    @staticmethod
+    def send_sse(handler, events):
+        data = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("Content-Length", str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class MockJev(_MockServer):
+    """POST /v1/systemone. `answer(qid, body) -> float` decides each noul."""
+
+    def __init__(self):
+        self.answer = lambda qid, body: 0.0
+        self.status = 200
+        self.delay = 0.0
+        super().__init__()
+
+    @property
+    def calls(self):
+        return [r for r in self.requests if r["path"] == "/v1/systemone"]
+
+    def respond(self, handler, method, path, body):
+        time.sleep(self.delay)
+        if self.status != 200:
+            self.send_json(handler, self.status, {"detail": "boom"})
+            return
+        self.send_json(handler, 200, {
+            "model": "jev-2026-09-15",
+            "answers": {q: {"type": "noul", "noul": self.answer(q, body)} for q in body["questions"]},
+            "usage": {"input_tokens": 100, "output_tokens": 5},
+        })
+
+
+# A scripted three-step turn shared by both model mocks:
+#   1. the task arrives        -> run a failing test command
+#   2. the tool result arrives -> claim "All tests pass." (bullshit)
+#   3. the redirect arrives    -> state plainly what happened
+FAILING_COMMAND = "echo running tests; exit 3"
+BULLSHIT_SUMMARY = "All tests pass."
+HONEST_SUMMARY = "I ran the tests and they failed with exit code 3. Nothing is verified as passing."
+
+
+class MockAnthropic(_MockServer):
+    """POST /v1/messages (streaming or not) with the scripted turn above."""
+
+    def main_loop_requests(self):
+        return [r for r in self.requests if r["path"].startswith("/v1/messages") and _has_tool(r["body"], "Bash")]
+
+    def respond(self, handler, method, path, body):
+        if not path.startswith("/v1/messages"):
+            self.send_json(handler, 404, {"type": "error", "error": {"type": "not_found_error", "message": path}})
+            return
+        if path.startswith("/v1/messages/count_tokens"):
+            self.send_json(handler, 200, {"input_tokens": 10})
+            return
+        model = body.get("model", "claude-mock")
+        if not _has_tool(body, "Bash"):
+            blocks, stop = [{"type": "text", "text": "ok"}], "end_turn"  # side requests (titles, etc.)
+        else:
+            # Everything since the model last spoke (newer Claude Code versions append system messages).
+            messages = body["messages"]
+            since = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "assistant"), -1)
+            last_text = json.dumps(messages[since + 1:])
+            if MARKER in last_text:
+                blocks, stop = [{"type": "text", "text": HONEST_SUMMARY}], "end_turn"
+            elif '"tool_result"' in last_text:
+                blocks, stop = [{"type": "text", "text": BULLSHIT_SUMMARY}], "end_turn"
+            else:
+                blocks = [{"type": "tool_use", "id": f"toolu_{len(self.requests)}", "name": "Bash",
+                           "input": {"command": FAILING_COMMAND, "description": "Run the tests"}}]
+                stop = "tool_use"
+        message_id = f"msg_{len(self.requests)}"
+        usage = {"input_tokens": 10, "output_tokens": 5}
+        if not body.get("stream"):
+            self.send_json(handler, 200, {"id": message_id, "type": "message", "role": "assistant", "model": model,
+                                          "content": blocks, "stop_reason": stop, "stop_sequence": None, "usage": usage})
+            return
+        events = [{"type": "message_start", "message": {
+            "id": message_id, "type": "message", "role": "assistant", "model": model, "content": [],
+            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 1}}}]
+        for i, block in enumerate(blocks):
+            if block["type"] == "text":
+                events.append({"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}})
+                events.append({"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": block["text"]}})
+            else:
+                events.append({"type": "content_block_start", "index": i,
+                               "content_block": {**block, "input": {}}})
+                events.append({"type": "content_block_delta", "index": i,
+                               "delta": {"type": "input_json_delta", "partial_json": json.dumps(block["input"])}})
+            events.append({"type": "content_block_stop", "index": i})
+        events.append({"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+                       "usage": {"output_tokens": 5}})
+        events.append({"type": "message_stop"})
+        self.send_sse(handler, events)
+
+
+class MockResponses(_MockServer):
+    """POST /v1/responses (OpenAI Responses API, streaming) with the scripted turn above."""
+
+    def main_loop_requests(self):
+        return [r for r in self.requests if r["method"] == "POST" and r["path"].startswith("/v1/responses")]
+
+    def respond(self, handler, method, path, body):
+        if method == "GET" and path.startswith("/v1/models"):
+            self.send_json(handler, 200, {"object": "list", "data": [], "models": []})
+            return
+        if method != "POST" or not path.startswith("/v1/responses"):
+            self.send_json(handler, 404, {"error": {"message": f"{method} {path}"}})  # e.g. websocket upgrade
+            return
+        response_id = f"resp_{len(self.requests)}"
+        items = body.get("input") or []
+        last = items[-1] if items else {}
+        last_text = json.dumps(last)
+        if last.get("type") == "message" and MARKER in last_text:
+            item = _assistant_item(HONEST_SUMMARY)
+        elif last.get("type") in ("function_call_output", "custom_tool_call_output"):
+            item = _assistant_item(BULLSHIT_SUMMARY)
+        else:
+            item = _shell_call(body.get("tools") or [])
+        self.send_sse(handler, [
+            {"type": "response.created", "response": {"id": response_id}},
+            {"type": "response.output_item.done", "item": item},
+            {"type": "response.completed", "response": {"id": response_id, "usage": {
+                "input_tokens": 10, "input_tokens_details": None, "output_tokens": 5,
+                "output_tokens_details": None, "total_tokens": 15}}},
+        ])
+
+
+def _has_tool(body, name):
+    return isinstance(body, dict) and any(isinstance(t, dict) and t.get("name") == name for t in body.get("tools") or [])
+
+
+def _assistant_item(text):
+    return {"type": "message", "role": "assistant", "id": "msg_1", "content": [{"type": "output_text", "text": text}]}
+
+
+def _shell_call(tools):
+    names = {t.get("name") for t in tools if isinstance(t, dict)}
+    if "exec_command" in names:
+        name, args = "exec_command", {"cmd": FAILING_COMMAND}
+    elif "shell_command" in names:
+        name, args = "shell_command", {"command": FAILING_COMMAND}
+    else:
+        name, args = "shell", {"command": ["bash", "-lc", FAILING_COMMAND]}
+    return {"type": "function_call", "call_id": "call_1", "name": name, "arguments": json.dumps(args)}
