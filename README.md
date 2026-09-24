@@ -2,6 +2,8 @@
 
 AI coding assistants sometimes finish with a summary that says more than they did: "All tests pass" when the tests never ran, "should work now", or an upbeat line that says nothing.
 
+That's bullshit in the philosopher Harry Frankfurt's sense: statements made without regard to whether they're true. [Machine Bullshit (Liang et al., 2025)](https://arxiv.org/abs/2507.07484) found it in large language models and sorted it into four forms: unverified claims, weasel words, empty rhetoric and paltering. jev-no-bullshit checks for those four.
+
 jev-no-bullshit checks each final summary against what the assistant actually did. If the summary bullshits, the assistant is sent back to check its work and say plainly what it did, what it verified, and what is unfinished.
 
 It works with **Claude Code** and **Codex**. The check is done by [Jev](https://typesafe.ai), a yes/no model from TypeSafe.
@@ -66,6 +68,8 @@ Where you see the note:
 - **Codex**: as Stop hook feedback, after a line like `Asking gpt-6-astra to reconsider its response after bullshit detection, attempt #1`.
 
 ### What gets flagged
+
+The four forms of bullshit from the paper:
 
 | Problem | Example |
 | --- | --- |
