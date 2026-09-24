@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "jev-no-bullshit", "timeout": 30 } ] }
+    ]
+  }
+}
