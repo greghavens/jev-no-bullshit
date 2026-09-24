@@ -134,6 +134,21 @@ class SentenceSplitTests(unittest.TestCase):
         self.assertEqual(hook.split_sentences("Ran:\n```\nls\npwd"), ["Ran:", "```\nls\npwd"])
 
 
+class ClaimGateTests(unittest.TestCase):
+    def test_unverified_flag_stands_only_on_a_claim(self):
+        values = {"claim_s0": 0.9, "unverified_s0": 0.9, "claim_s1": 0.1, "unverified_s1": 0.9, "unverified_s2": 0.9}
+        flagged = hook.find_flags(values, {hook.UNVERIFIED: 0.6})
+        # s1 reads as no claim; s2's claim question went unanswered, so it counts as one.
+        self.assertEqual(flagged, {hook.UNVERIFIED: ["unverified_s0", "unverified_s2"]})
+
+    def test_unverified_flag_stands_only_when_not_marked(self):
+        values = {"marked_s0": 0.1, "unverified_s0": 0.9, "marked_s1": 0.9, "unverified_s1": 0.9}
+        self.assertEqual(hook.find_flags(values, {hook.UNVERIFIED: 0.6}), {hook.UNVERIFIED: ["unverified_s0"]})
+
+    def test_no_claims_means_no_unverified_flags(self):
+        self.assertEqual(hook.find_flags({"claim_s0": 0.2, "unverified_s0": 0.9}, {hook.UNVERIFIED: 0.6}), {})
+
+
 class ThresholdTests(unittest.TestCase):
     def test_thresholds(self):
         self.assertEqual([hook.threshold(k) for k in range(3)], [0.6, 0.6, 0.6])
@@ -329,9 +344,53 @@ class SizeTests(unittest.TestCase):
 
     def test_inputs_clip_shorter_than_results(self):
         action = hook.make_action("Bash", "A" * 1000 + "Z" * 1000, "B" * 1000 + "Y" * 1000, False)
-        self.assertLess(len(action["input"]), 400)
-        self.assertTrue(action["input"].startswith("A" * 150) and action["input"].endswith("Z" * 150))
-        self.assertEqual(action["result"], "B" * 1000 + "Y" * 1000)
+        state, _ = hook.build_state("task", [action], "Did it.", hook.state_token_budget())
+        kept = state["actions"][0]
+        self.assertLess(len(kept["input"]), 400)
+        self.assertTrue(kept["input"].startswith("A" * 150) and kept["input"].endswith("Z" * 150))
+        self.assertEqual(kept["result"], "B" * 1000 + "Y" * 1000)
+
+    def test_inputs_keep_middle_pieces_the_summary_cites(self):
+        command = ("cd /repo; " + "x" * 400 + "; git commit -qm 'Fix the parser' && git push origin main && "
+                   + "python3 - <<'EOF'\n" + "\n".join(f"step_{i} = {i}" for i in range(80))
+                   + "\nrows = db.query('select count(*) from harness_runs')\nEOF\n" + "y" * 400)
+        action = hook.make_action("Bash", {"command": command}, "ok", False)
+        summary = "I committed and pushed the fix. The query on `harness_runs` didn't run."
+        kept = hook.build_state("task", [action], summary, hook.state_token_budget())[0]["actions"][0]["input"]
+        self.assertIn("git push origin main", kept)
+        self.assertIn("git commit", kept)
+        self.assertIn("harness_runs", kept)
+        self.assertNotIn("step_40", kept)
+        self.assertLess(len(kept), hook.INPUT_CLIP_CHARS + hook.INPUT_EVIDENCE_CHARS + 200)
+        # Without anything to back up, only the head and tail are kept.
+        plain = hook.build_state("task", [action], "Done.", hook.state_token_budget())[0]["actions"][0]["input"]
+        self.assertNotIn("git push", plain)
+        self.assertLess(len(plain), 400)
+
+    def test_earlier_actions_keep_the_ones_the_summary_cites(self):
+        earlier = [hook.make_action("Bash", f"cmd {i}", f"out {i}", False) for i in range(40)]
+        earlier[3] = hook.make_action("Bash", "scan", "scanned 216 files in graph_builder", False)
+        newest = [f"cmd {i}" for i in range(30, 40)]
+        summary = "The full scan of all 216 files in `graph_builder` is done."
+        state, _ = hook.build_state("task", [], summary, hook.state_token_budget(), earlier)
+        self.assertEqual([a["input"] for a in state["earlier_actions"]], ["scan"] + newest)
+        # One match is not enough, and without a match only the newest are kept.
+        for summary in ("The full scan of all 216 files is done.", "Done."):
+            state, _ = hook.build_state("task", [], summary, hook.state_token_budget(), earlier)
+            self.assertEqual([a["input"] for a in state["earlier_actions"]], newest)
+
+    def test_no_paltering_questions_for_tool_mechanics(self):
+        actions = [
+            hook.make_action("ToolSearch", {"query": "select:Monitor"}, "", False),
+            hook.make_action("Monitor", {}, "<tool_use_error>InputValidationError: bad input</tool_use_error>", True),
+            hook.make_action("Bash", "sleep 999", "Command running in background with ID: b1. Output is being written to: x", False),
+            hook.make_action("Bash", "make", "Command did not complete within its 600s timeout and was moved to the background", False),
+            hook.make_action("Edit", {}, "<tool_use_error>Found 2 matches of the string to replace</tool_use_error>", True),
+        ]
+        state, _ = hook.build_state("task", actions, "Done.", hook.state_token_budget())
+        questions, _, _ = hook.build_questions(state)
+        self.assertEqual(sorted(q for q in questions if q.startswith("palter")), ["palter_a3", "palter_a4"])
+        self.assertEqual(len(state["actions"]), 5)
 
     def test_state_drops_oldest_actions(self):
         actions = [hook.make_action("Bash", f"cmd {i}", "x " * 2500, False) for i in range(60)]
@@ -377,7 +436,7 @@ class SizeTests(unittest.TestCase):
         actions = [hook.make_action("Bash", f"cmd {i}", "ok", False) for i in range(10)]
         state, _ = hook.build_state("task", actions, "One. Two.", hook.state_token_budget())
         full, palters, sentences = hook.build_questions(state)
-        self.assertEqual((len(full), palters, sentences), (16, 0, 0))
+        self.assertEqual((len(full), palters, sentences), (20, 0, 0))
         need = hook.REQUEST_OVERHEAD_TOKENS + hook.estimate_tokens(state) + sum(map(hook.question_tokens, full.values()))
         palter_cost = hook.question_tokens(full["palter_a0"])
         with mock.patch.object(hook, "REQUEST_TOKEN_LIMIT", (need - palter_cost) * hook.ESTIMATE_MARGIN):
@@ -455,7 +514,7 @@ class HookRunTests(unittest.TestCase):
         self.assertEqual(body["state"]["sentences"], ["Fixed the login bug.", "All tests are passing and the flow is solid."])
         self.assertEqual(
             sorted(body["questions"]),
-            sorted(["unverified_s0", "weasel_s0", "rhetoric_s0", "unverified_s1", "weasel_s1", "rhetoric_s1", "palter_a0", "palter_a1"]),
+            sorted(["claim_s0", "marked_s0", "unverified_s0", "weasel_s0", "rhetoric_s0", "claim_s1", "marked_s1", "unverified_s1", "weasel_s1", "rhetoric_s1", "palter_a0", "palter_a1"]),
         )
         self.assertEqual(body["questions"]["unverified_s1"], hook.make_question("unverified", 1))
         self.assertEqual(

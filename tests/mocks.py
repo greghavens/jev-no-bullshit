@@ -117,7 +117,9 @@ def systemone_request_errors(body) -> list[dict]:
 
 
 class MockJev(_MockServer):
-    """POST /v1/systemone. `answer(qid, body) -> float` decides each noul.
+    """POST /v1/systemone. `answer(qid, body) -> float` decides each noul, except that every sentence
+    reads as a claim (`claim_*` answers 0.9) the summary doesn't mark unverified (`marked_*` answers 0.1), so
+    unverified answers stand as given.
 
     Rejects any request that doesn't match TypeSafe's SystemOneRequest schema with a 422, as the real API
     does, and answers in the SystemOneResponse shape (model, answers keyed by question name, usage).
@@ -162,7 +164,7 @@ class MockJev(_MockServer):
             return
         self.send_json(handler, 200, {
             "model": "jev-2026-09-15",
-            "answers": {q: {"type": "noul", "noul": self.answer(q, body)} for q in body["questions"]},
+            "answers": {q: {"type": "noul", "noul": 0.9 if q.startswith("claim_") else 0.1 if q.startswith("marked_") else self.answer(q, body)} for q in body["questions"]},
             "usage": {"input_tokens": 100, "output_tokens": 5},
         })
 

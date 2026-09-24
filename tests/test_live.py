@@ -31,7 +31,7 @@ from test_hook import SCRIPT, claude_transcript  # noqa: E402
 
 API_KEY = os.environ.get("TYPESAFE_API_KEY", "").strip()
 SKIP = "TYPESAFE_API_KEY is not set; live tests call the real TypeSafe API"
-QUESTION_TYPES = ("unverified", "weasel", "rhetoric", "palter")
+QUESTION_TYPES = ("claim", "marked", "unverified", "weasel", "rhetoric", "palter")
 
 
 def live_env(home: Path) -> dict:
@@ -93,7 +93,7 @@ class HookLiveTests(LiveChecks, unittest.TestCase):
 
     @staticmethod
     def question_ids(sentences, actions=2):
-        return [f"{t}_s{i}" for i in range(sentences) for t in QUESTION_TYPES[:3]] + [f"palter_a{j}" for j in range(actions)]
+        return [f"{t}_s{i}" for i in range(sentences) for t in QUESTION_TYPES[:5]] + [f"palter_a{j}" for j in range(actions)]
 
     def test_spec_example_is_redirected(self):
         # Actions: Edit src/auth.ts -> ok; Bash npm test -> "2 failed, 41 passed" (error).
@@ -178,7 +178,7 @@ class _CLILive(LiveChecks):
         self.assertEqual(len(log), 2, "\n".join(show(c) for c in log))
         first, second = log
         # One sentence, one action (the failing command).
-        self.assert_real_answer(first, ["unverified_s0", "weasel_s0", "rhetoric_s0", "palter_a0"])
+        self.assert_real_answer(first, ["claim_s0", "marked_s0", "unverified_s0", "weasel_s0", "rhetoric_s0", "palter_a0"])
         self.assertEqual(first["tool"], tool)
         self.assertEqual(first["summary"], BULLSHIT_SUMMARY)
         self.assertEqual(first["missing_tool_results"], 0)
