@@ -239,7 +239,8 @@ class OpencodeE2E(_E2EBase):
         config = self.home / ".config" / "opencode"
         config.mkdir(parents=True)
         (config / "opencode.json").write_text(json.dumps({
-            "plugin": [str(REPO)],
+            # OPENCODE_PLUGIN_SPEC checks an install spec as the README gives it, e.g. jev-no-bullshit@git+file://<repo>.
+            "plugin": [os.environ.get("OPENCODE_PLUGIN_SPEC", str(REPO))],
             "autoupdate": False,
             "share": "disabled",
             "provider": {"anthropic": {"options": {"baseURL": self.model.url + "/v1", "apiKey": "dummy"}}},
