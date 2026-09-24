@@ -42,6 +42,16 @@ class PluginLayoutTests(unittest.TestCase):
             self.assertEqual(handler["command"], "jev-no-bullshit")
             self.assertEqual(handler["timeout"], load("hooks/hooks.json")["hooks"]["Stop"][0]["hooks"][0]["timeout"])
 
+    def test_every_manifest_carries_the_same_version(self):
+        versions = {name: load(name)["version"] for name in
+                    (".claude-plugin/plugin.json", ".codex-plugin/plugin.json", "package.json")}
+        self.assertEqual(len(set(versions.values())), 1, versions)
+
+    def test_package_points_pi_and_opencode_at_their_entry_files(self):
+        package = load("package.json")
+        for entry in [package["main"], *package["pi"]["extensions"]]:
+            self.assertTrue((REPO / entry).is_file(), entry)
+
 
 if __name__ == "__main__":
     unittest.main()

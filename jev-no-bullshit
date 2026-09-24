@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""jev-no-bullshit: a Stop hook for Claude Code and Codex.
+"""jev-no-bullshit: a Stop hook for Claude Code and Codex, and the check behind the pi and opencode plugins.
 
 When a turn ends, ask Jev (TypeSafe's System One model) whether the model's
 final summary bullshits about what it did, measured against the tool calls it
@@ -8,6 +8,12 @@ feedback on that type. See docs/jev-no-bullshit-spec.md.
 
 Standard library only. Reads TYPESAFE_API_KEY from the environment. Always
 exits 0 and fails open: any error lets the turn end.
+
+Claude Code and Codex send a Stop event naming their transcript. The pi and
+opencode plugins (pi/, opencode/) have no transcript file to name, so they send
+the turn itself: {"host", "session_id", "task", "actions", "earlier_actions",
+"model", "last_assistant_message", "stop_hook_active"}, each action being
+{"tool", "input", "result", "error"}.
 """
 
 from __future__ import annotations
@@ -922,16 +928,32 @@ def build_reason(flagged: dict[str, list[str]], state: dict, dropped_actions: in
 # Main
 
 
+def given_turn(hook_input: dict) -> tuple[str, list[dict], str | None, int, list[dict]]:
+    """Return (task, actions, model, tool calls still without a result, earlier actions) as a plugin sent them."""
+
+    def actions(key: str) -> list[dict]:
+        calls = hook_input.get(key)
+        return [
+            make_action(str(c.get("tool") or ""), c.get("input"), c.get("result"), bool(c.get("error")))
+            for c in calls if isinstance(c, dict)
+        ] if isinstance(calls, list) else []
+
+    now = actions("actions")
+    pending = sum(1 for a in now if a["result"] == NO_RESULT)
+    return str(hook_input.get("task") or "").strip(), now, hook_input.get("model") or None, pending, actions("earlier_actions")
+
+
 def run(hook_input: dict) -> dict | None:
     """Check one Stop event. Return the hook output to print, or None to let the turn end."""
     session_id = str(hook_input.get("session_id") or "unknown")
-    is_codex = "turn_id" in hook_input
-    tool = "codex" if is_codex else "claude"
+    host = hook_input.get("host") if isinstance(hook_input.get("actions"), list) else None
+    is_codex = host is None and "turn_id" in hook_input
+    tool = str(host) if host else "codex" if is_codex else "claude"
     # In Claude Code the hooks module (hooks/jev.tsx) runs this script before the plain Stop hook in
     # hooks/hooks.json. It marks the reply it checked, and the plain hook then stands down. Where
     # Claude Code does not load modules, nothing marks the reply and the plain hook checks it.
     module = os.environ.get("JEV_NO_BULLSHIT_MODULE") == "1"
-    if not is_codex:
+    if tool == "claude":
         digest = reply_digest(hook_input.get("last_assistant_message") or "")
         mark = module_mark_path(session_id)
         if module:
@@ -961,9 +983,12 @@ def run(hook_input: dict) -> dict | None:
         log({**base, "error": "TYPESAFE_API_KEY is not set", "summary": summary})
         return None
 
-    task, actions, transcript_model, pending, earlier = read_transcript(
-        hook_input.get("transcript_path"), parse_codex if is_codex else parse_claude
-    )
+    if host:
+        task, actions, transcript_model, pending, earlier = given_turn(hook_input)
+    else:
+        task, actions, transcript_model, pending, earlier = read_transcript(
+            hook_input.get("transcript_path"), parse_codex if is_codex else parse_claude
+        )
     model = (hook_input.get("model") if is_codex else None) or transcript_model or "the model"
 
     thresholds = {t: threshold(counters["flags"][t]) for t in TYPES}
@@ -1031,7 +1056,7 @@ def run(hook_input: dict) -> dict | None:
             counters["callouts"][key] = counters["callouts"].get(key, 0) + 1
     save_counters(session_id, counters)
     output = {"decision": "block", "reason": build_reason(flagged, state, dropped_actions)}
-    if is_codex or not module:  # in Claude Code the module sends the reason itself as a prompt
+    if tool != "claude" or not module:  # in Claude Code the module sends the reason itself as a prompt
         output["systemMessage"] = (
             f"Asking {model} to reconsider its response after bullshit detection, attempt #{counters['attempt']}"
         )

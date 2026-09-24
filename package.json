@@ -1,0 +1,13 @@
+{
+  "name": "jev-no-bullshit",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Asks Jev whether the model's final summary bullshits about what it did, and sends the model back to restate it plainly.",
+  "type": "module",
+  "repository": "github:greghavens/jev-no-bullshit",
+  "keywords": ["pi-package", "opencode", "jev", "typesafe"],
+  "main": "./opencode/jev-no-bullshit.ts",
+  "pi": {
+    "extensions": ["./pi/jev-no-bullshit.ts"]
+  }
+}

@@ -6,12 +6,13 @@ That's bullshit in the philosopher Harry Frankfurt's sense: statements made with
 
 jev-no-bullshit checks each final summary against what the assistant actually did. If the summary bullshits, the assistant is sent back to check its work and say plainly what it did, what it verified, and what is unfinished.
 
-It works with **Claude Code** and **Codex**. The check is done by [Jev](https://typesafe.ai), a yes/no model from TypeSafe.
+It works with **Claude Code**, **Codex**, **pi** and **opencode**. The check is done by [Jev](https://typesafe.ai), a yes/no model from TypeSafe.
 
 ## What you need
 
 - A TypeSafe API key.
 - Python 3.10 or later. Check with `python3 --version`.
+- For pi or opencode, `git` too.
 
 ## Install
 
@@ -45,6 +46,22 @@ codex plugin add jev-no-bullshit@jev-no-bullshit
 
 Then start `codex`, type `/hooks`, and approve the **jev-no-bullshit** Stop hook. Codex won't run a plugin's hook until you approve it.
 
+**pi**: run this in your terminal:
+
+```sh
+pi install git:github.com/greghavens/jev-no-bullshit
+```
+
+Then start a new pi session.
+
+**opencode**: run this in your terminal:
+
+```sh
+opencode plugin -g "jev-no-bullshit@git+https://github.com/greghavens/jev-no-bullshit.git"
+```
+
+Then start a new opencode session.
+
 That's it.
 
 ## Using it
@@ -66,6 +83,8 @@ Where you see the note:
 
 - **Claude Code**: below the flagged reply, as a prompt that Claude Code labels as coming from the plugin. If you type a message while the assistant is still working, the note is dropped.
 - **Codex**: as Stop hook feedback, after a line like `Asking gpt-6-astra to reconsider its response after bullshit detection, attempt #1`.
+- **pi**: as a **jev-no-bullshit** message below the flagged reply. The assistant answers it in the same run.
+- **opencode**: as a new prompt below the flagged reply, which starts a turn of its own. `opencode run` exits when the assistant first finishes, before that turn can start, so one-shot runs are checked but not sent back.
 
 ### What gets flagged
 
@@ -107,6 +126,14 @@ claude plugin uninstall jev-no-bullshit@jev-no-bullshit
 ```sh
 codex plugin remove jev-no-bullshit@jev-no-bullshit
 ```
+
+**pi**:
+
+```sh
+pi remove git:github.com/greghavens/jev-no-bullshit
+```
+
+**opencode**: delete the `jev-no-bullshit@…` line from `plugin` in `~/.config/opencode/opencode.json`.
 
 ---
 

@@ -180,7 +180,7 @@ class MockAnthropic(_MockServer):
     """POST /v1/messages (streaming or not) with the scripted turn above."""
 
     def main_loop_requests(self):
-        return [r for r in self.requests if r["path"].startswith("/v1/messages") and _has_tool(r["body"], "Bash")]
+        return [r for r in self.requests if r["path"].startswith("/v1/messages") and _shell_tool(r["body"])]
 
     def respond(self, handler, method, path, body):
         if not path.startswith("/v1/messages"):
@@ -190,7 +190,8 @@ class MockAnthropic(_MockServer):
             self.send_json(handler, 200, {"input_tokens": 10})
             return
         model = body.get("model", "claude-mock")
-        if not _has_tool(body, "Bash"):
+        shell = _shell_tool(body)
+        if not shell:
             blocks, stop = [{"type": "text", "text": "ok"}], "end_turn"  # side requests (titles, etc.)
         else:
             # Everything since the model last spoke (newer Claude Code versions append system messages).
@@ -202,7 +203,7 @@ class MockAnthropic(_MockServer):
             elif '"tool_result"' in last_text:
                 blocks, stop = [{"type": "text", "text": BULLSHIT_SUMMARY}], "end_turn"
             else:
-                blocks = [{"type": "tool_use", "id": f"toolu_{len(self.requests)}", "name": "Bash",
+                blocks = [{"type": "tool_use", "id": f"toolu_{len(self.requests)}", "name": shell,
                            "input": {"command": FAILING_COMMAND, "description": "Run the tests"}}]
                 stop = "tool_use"
         message_id = f"msg_{len(self.requests)}"
@@ -264,6 +265,11 @@ class MockResponses(_MockServer):
 
 def _has_tool(body, name):
     return isinstance(body, dict) and any(isinstance(t, dict) and t.get("name") == name for t in body.get("tools") or [])
+
+
+def _shell_tool(body):
+    """The shell tool's name: Claude Code's "Bash", or "bash" in pi and opencode."""
+    return next((name for name in ("Bash", "bash") if _has_tool(body, name)), None)
 
 
 def _assistant_item(text):

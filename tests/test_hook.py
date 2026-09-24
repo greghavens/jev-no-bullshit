@@ -535,6 +535,33 @@ class HookRunTests(unittest.TestCase):
         self.assertIn("action 2 (shell: npm test -> 2 failed, 41 passed)", output["reason"])
         self.assertEqual(self.log_lines()[-1]["tool"], "codex")
 
+    def test_host_supplied_turn(self):
+        # pi and opencode send the turn itself; any transcript path is ignored, and so is the Claude Code module mark.
+        self.jev.answer = lambda q, body: 0.9 if q == "palter_a1" else 0.0
+        turn = {
+            "host": "pi",
+            "task": "  Fix the tests.  ",
+            "actions": [
+                {"tool": "bash", "input": {"command": "npm test"}, "result": "2 failed, 41 passed", "error": True},
+                {"tool": "read", "input": {"path": "a.ts"}, "result": None, "error": False},
+            ],
+            "earlier_actions": [{"tool": "bash", "input": {"command": "ls"}, "result": "a.ts", "error": False}],
+            "model": "claude-mock",
+        }
+        output = self.run_hook(summary="Fixed it.", **turn)
+        self.assertEqual(output["systemMessage"], "Asking claude-mock to reconsider its response after bullshit detection, attempt #1")
+        self.assertIn("action 2 (read: a.ts -> (no result recorded))", output["reason"])
+        state = self.jev.calls[0]["body"]["state"]
+        self.assertEqual(state["task"], "Fix the tests.")
+        self.assertEqual([a["tool"] for a in state["actions"]], ["bash", "read"])
+        self.assertTrue(state["actions"][0]["error"])
+        self.assertEqual(state["earlier_actions"][0]["result"], "a.ts")
+        entry = self.log_lines()[-1]
+        self.assertEqual((entry["tool"], entry["missing_tool_results"]), ("pi", 1))
+        # stop_hook_active carries the counters over, as it does for Codex.
+        self.run_hook(summary="Fixed it.", active=True, **turn)
+        self.assertEqual(self.log_lines()[-1]["attempt"], 1)
+
     def test_model_fallback(self):
         self.transcript = self.home / "missing.jsonl"
         self.jev.answer = lambda q, body: 0.9
