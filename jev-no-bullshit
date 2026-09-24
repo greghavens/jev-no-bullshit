@@ -35,6 +35,9 @@ TRANSCRIPT_WAIT_SECONDS = 3.0
 NO_RESULT = "(no result recorded)"
 
 MAX_REDIRECTS = 3
+# How many times the same sentence or action may be called out per prompt. A revision that names a
+# failure and then answers a later note without repeating it gets the failure flagged again.
+DEFAULT_MAX_CALLOUTS = 1
 BASE_THRESHOLD = 0.6
 # Earlier turns' actions back up claims about work done before the task message. More than this
 # many buries the current turn: on replayed checks, 50 earlier actions cut the scores of planted
@@ -42,6 +45,11 @@ BASE_THRESHOLD = 0.6
 EARLIER_ACTIONS_LIMIT = 10
 
 RESULT_CLIP_CHARS = 2_000
+# A clipped result also keeps up to this many characters of middle lines holding the summary's numbers
+# or code terms. Head and tail alone dropped a query's rows from the middle of its output, and a
+# summary quoting those rows was flagged as unverified three times.
+RESULT_EVIDENCE_CHARS = 1_000
+EVIDENCE_LINE_CHARS = 300
 # Long inputs, like scripts, bury the evidence in results. On replays of 72 real checks, clipping
 # inputs to 300 cut false unverified flags on sessions full of look-alike scripts (0.77 to 0.20)
 # and changed nothing clear elsewhere. Clipping results too hid real evidence, so they stay long.
@@ -185,7 +193,7 @@ def reply_digest(reply: str) -> str:
 
 
 def fresh_counters() -> dict:
-    return {"attempt": 0, "flags": {t: 0 for t in TYPES}}
+    return {"attempt": 0, "flags": {t: 0 for t in TYPES}, "callouts": {}}
 
 
 def load_counters(session_id: str, stop_hook_active: bool) -> dict:
@@ -200,6 +208,7 @@ def load_counters(session_id: str, stop_hook_active: bool) -> dict:
         counters["attempt"] = int(raw.get("attempt", 0))
         for t in TYPES:
             counters["flags"][t] = int(raw.get("flags", {}).get(t, 0))
+        counters["callouts"] = {str(k): int(v) for k, v in (raw.get("callouts") or {}).items()}
         return counters
     except (OSError, ValueError, TypeError, AttributeError):
         return fresh_counters()
@@ -224,6 +233,15 @@ def log(entry: dict) -> None:
         print(f"jev-no-bullshit: cannot write log ({error}): {json.dumps(entry)}", file=sys.stderr)
 
 
+def max_callouts() -> int:
+    """JEV_NO_BULLSHIT_MAX_CALLOUTS, or the default when it is unset or not a whole number of at least 1."""
+    try:
+        value = int(os.environ.get("JEV_NO_BULLSHIT_MAX_CALLOUTS", ""))
+    except ValueError:
+        return DEFAULT_MAX_CALLOUTS
+    return value if value >= 1 else DEFAULT_MAX_CALLOUTS
+
+
 def threshold(times_flagged: int) -> float:
     """The same bar on every attempt; MAX_REDIRECTS is what ends a run of redirects."""
     return BASE_THRESHOLD
@@ -239,6 +257,58 @@ def clip(text: str, limit: int = RESULT_CLIP_CHARS) -> str:
         return text
     half = limit // 2
     return f"{text[:half]}\n…[{len(text) - 2 * half} chars omitted]…\n{text[-half:]}"
+
+
+_NUMBER_RE = re.compile(r"\d+(?:[,_]\d{3})*(?:\.\d+)?")
+_CODE_TERM_RE = re.compile(r"`([^`\n]{3,80})`|\b([A-Za-z][\w.\-/]*[_./][\w.\-/]*\w)")
+_DIGIT_GROUP_RE = re.compile(r"(?<=\d)[,_](?=\d{3})")
+
+
+def evidence_terms(summary: str) -> tuple[set[str], set[str]]:
+    """Return (numbers, code terms) from the summary that a result line can back up.
+
+    Numbers lose digit-group separators, so 18,695 matches 18695; one-digit numbers match too much.
+    """
+    numbers = {n for n in (_DIGIT_GROUP_RE.sub("", m) for m in _NUMBER_RE.findall(summary)) if len(n.replace(".", "")) >= 2}
+    terms = {(a or b) for a, b in _CODE_TERM_RE.findall(summary)}
+    return numbers, {t for t in terms if len(t) >= 4}
+
+
+def clip_result(text: str, evidence: tuple[set[str], set[str]] = (set(), set())) -> str:
+    """Keep the head and tail of a long result, plus the middle lines that hold the summary's evidence."""
+    if len(text) <= RESULT_CLIP_CHARS:
+        return text
+    half = RESULT_CLIP_CHARS // 2
+    numbers, terms = evidence
+    middle_start, middle_end = half, len(text) - half
+    picked = []  # (matches, start, end)
+    if numbers or terms:
+        pos = 0
+        for line in text.splitlines(keepends=True):
+            start, end = pos, pos + len(line)
+            pos = end
+            if end <= middle_start or start >= middle_end:
+                continue
+            found = set(_DIGIT_GROUP_RE.sub("", n) for n in _NUMBER_RE.findall(line)) & numbers
+            hits = len(found) + sum(1 for t in terms if t in line)
+            if hits:
+                picked.append((hits, max(start, middle_start), min(end, middle_end)))
+    room = RESULT_EVIDENCE_CHARS
+    keep = []
+    for hits, start, end in sorted(picked, key=lambda p: (-p[0], p[1])):  # most matches first, then earliest
+        line = text[start:end].rstrip("\n")
+        if len(line) > EVIDENCE_LINE_CHARS:
+            line = line[: EVIDENCE_LINE_CHARS - 1] + "…"
+        if len(line) > room:
+            continue
+        room -= len(line)
+        keep.append((start, end, line))
+    parts, last = [text[:middle_start]], middle_start
+    for start, end, line in sorted(keep):
+        parts.append(f"\n…[{start - last} chars omitted]…\n{line}")
+        last = end
+    parts.append(f"\n…[{middle_end - last} chars omitted]…\n{text[middle_end:]}")
+    return "".join(parts)
 
 
 def one_line(text: str, limit: int) -> str:
@@ -367,7 +437,7 @@ def make_action(tool: str, tool_input, result: str | None, error: bool) -> dict:
     return {
         "tool": tool or "unknown",
         "input": clip(stringify(tool_input), INPUT_CLIP_CHARS),
-        "result": clip(result) if result is not None else NO_RESULT,
+        "result": result if result is not None else NO_RESULT,  # clipped in build_state, against the summary
         "error": bool(error),
     }
 
@@ -615,6 +685,9 @@ def build_state(
     The last EARLIER_ACTIONS_LIMIT actions of earlier turns fill whatever room is left, newest first;
     they are evidence for the summary only.
     """
+    evidence = evidence_terms(summary)
+    actions = [{**a, "result": clip_result(a["result"], evidence)} for a in actions]
+    earlier = [{**a, "result": clip_result(a["result"], evidence)} for a in earlier[-EARLIER_ACTIONS_LIMIT:]]
     state = {
         "task": clip(task, 8_000),
         "actions": [],
@@ -777,6 +850,31 @@ def find_flags(values: dict[str, float], thresholds: dict[str, float]) -> dict[s
     return flagged
 
 
+def callout_key(qid: str, state: dict) -> str:
+    """Name a flag by what it points at, not its index: indices shift between attempts."""
+    qtype, ref = qid.rsplit("_", 1)
+    index = int(ref[1:])
+    if qtype == PALTER:
+        action = state["actions"][index]
+        # Only the head and tail: the evidence kept from a result's middle changes with the summary.
+        half = RESULT_CLIP_CHARS // 2
+        target = f"{action['tool']}\0{action['input']}\0{action['result'][:half]}\0{action['result'][-half:]}"
+    else:
+        target = one_line(state["sentences"][index], SENTENCE_CLIP_CHARS)
+    return hashlib.sha256(f"{qtype}\0{target}".encode()).hexdigest()[:16]
+
+
+def drop_repeats(flagged: dict[str, list[str]], state: dict, callouts: dict, limit: int):
+    """Split flags into those still under the per-item limit and those already called out enough."""
+    kept: dict[str, list[str]] = {}
+    repeats: dict[str, list[str]] = {}
+    for t, ids in flagged.items():
+        for qid in ids:
+            target = repeats if callouts.get(callout_key(qid, state), 0) >= limit else kept
+            target.setdefault(t, []).append(qid)
+    return kept, repeats
+
+
 # ---------------------------------------------------------------------------
 # Redirect
 
@@ -905,7 +1003,7 @@ def run(hook_input: dict) -> dict | None:
 
     # Answers without a numeric noul are ignored; log them, or an API change would silently flag nothing.
     unanswered = sorted(set(questions) - set(values))
-    flagged = find_flags(values, thresholds)
+    flagged, repeats = drop_repeats(find_flags(values, thresholds), state, counters["callouts"], max_callouts())
     capped = bool(flagged) and counters["attempt"] >= MAX_REDIRECTS
     redirect = bool(flagged) and not capped
     log(
@@ -916,6 +1014,7 @@ def run(hook_input: dict) -> dict | None:
             "answers": values,
             **({"unanswered": unanswered} if unanswered else {}),
             "flagged": flagged,
+            **({"repeats": repeats} if repeats else {}),
             "redirected": redirect,
             "capped": capped,
             "summary": summary,
@@ -925,8 +1024,11 @@ def run(hook_input: dict) -> dict | None:
         return None
 
     counters["attempt"] += 1
-    for t in flagged:
+    for t, ids in flagged.items():
         counters["flags"][t] += 1
+        for qid in ids:
+            key = callout_key(qid, state)
+            counters["callouts"][key] = counters["callouts"].get(key, 0) + 1
     save_counters(session_id, counters)
     output = {"decision": "block", "reason": build_reason(flagged, state, dropped_actions)}
     if is_codex or not module:  # in Claude Code the module sends the reason itself as a prompt

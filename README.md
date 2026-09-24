@@ -60,7 +60,7 @@ Each time the assistant finishes, its summary is checked. If the summary is hone
 Then rewrite your summary plainly: what you did, what you verified and how, and what failed or is unfinished.
 ```
 
-The assistant checks its work and writes a new summary, which is checked the same way. It's sent back at most 3 times per request, so it never gets stuck.
+The assistant checks its work and writes a new summary, which is checked the same way. It's sent back at most 3 times per request, so it never gets stuck, and each sentence or action is called out only once per request.
 
 Where you see the note:
 
@@ -92,7 +92,7 @@ If jev-no-bullshit itself runs into a problem (no key, no network, Jev takes mor
 
 ### Privacy
 
-To run a check, the assistant's final summary, your request, and its tool calls (each input cut to about 300 characters) and their results (each cut to about 2,000 characters) are sent to the TypeSafe API.
+To run a check, the assistant's final summary, your request, and its tool calls (each input cut to about 300 characters) and their results (each cut to about 2,000 characters, plus up to 1,000 characters of lines holding numbers or code terms your summary cites) are sent to the TypeSafe API.
 
 ## Turn it off
 
@@ -131,6 +131,16 @@ Use this or the plugin, not both. With both, every check runs twice.
 
 Showing the note as a prompt uses Claude Code's plugin hook modules, which are in early access. They stay off with a third-party model provider (Bedrock, Vertex, a custom `ANTHROPIC_BASE_URL`), with nonessential traffic disabled, or on accounts the rollout hasn't reached. Set `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` to turn them on anyway. Without them, replies are still checked, but Claude Code shows the note as "Stop hook feedback" under a "Stop hook error" row.
 
+### Call out the same thing more than once
+
+By default, once a sentence or action has been called out, it isn't called out again for the same request, even if a later reply repeats the sentence or leaves the failure out again. To allow more callouts per item, set `JEV_NO_BULLSHIT_MAX_CALLOUTS` the same way as your API key, for example:
+
+```sh
+export JEV_NO_BULLSHIT_MAX_CALLOUTS=2
+```
+
+It must be a whole number of at least 1; any other value is treated as 1. The limit of 3 redirects per request still applies.
+
 ### Other ways to set the key
 
 - **Claude Code only**: add it to your user settings file, `~/.claude/settings.json`, as `{"env": {"TYPESAFE_API_KEY": "..."}}`.
@@ -139,7 +149,7 @@ Showing the note as a prompt uses Claude Code's plugin hook modules, which are i
 ### Files it writes
 
 - `~/.jev-no-bullshit/log.jsonl`: one line per check, with the time, session, attempt, every question's score, the thresholds, what was flagged, and whether it sent the assistant back.
-- `~/.jev-no-bullshit/state/<session>.json`: redirect counters for the current answer.
+- `~/.jev-no-bullshit/state/<session>.json`: redirect counters and callout counts for the current request.
 
 The folder is created readable only by you. The key is only ever sent over https.
 

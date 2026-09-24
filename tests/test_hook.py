@@ -269,6 +269,36 @@ class SizeTests(unittest.TestCase):
         self.assertTrue(clipped.startswith("A" * 1000) and clipped.endswith("Z" * 1000))
         self.assertIn("[4000 chars omitted]", clipped)
 
+    def test_results_keep_middle_lines_the_summary_cites(self):
+        rows = "{'stage': 'ingest', 'status': 'done', 'count': 18695}\n"
+        result = "x" * 1500 + "\n" + "noise line\n" * 100 + rows + "y" * 1500
+        summary = "Stage progress: ingest 18,695 done."
+        clipped = hook.clip_result(result, hook.evidence_terms(summary))
+        self.assertIn(rows.strip(), clipped)
+        self.assertTrue(clipped.startswith("x" * 1000) and clipped.endswith("y" * 1000))
+        self.assertNotIn("noise line", clipped)
+
+    def test_results_without_cited_lines_clip_as_before(self):
+        result = "A" * 3000 + "\n" + "Z" * 3000
+        self.assertEqual(hook.clip_result(result, hook.evidence_terms("Ran 12 tests in `test_hook.py`.")), hook.clip(result))
+
+    def test_cited_middle_lines_are_capped(self):
+        result = "h" * 1000 + "\n" + "count 4242 " * 40 + "\n" + "row 4242\n" * 500 + "t" * 1000
+        clipped = hook.clip_result(result, hook.evidence_terms("There are 4242 rows."))
+        self.assertLessEqual(len(clipped), hook.RESULT_CLIP_CHARS + hook.RESULT_EVIDENCE_CHARS + 3000)
+        self.assertIn("count 4242 count", clipped)
+
+    def test_evidence_terms(self):
+        numbers, terms = hook.evidence_terms("Ingest 18,695 done, 4 pending, score 0.52 in `jev_graph.py` and src/main.rs.")
+        self.assertEqual(numbers, {"18695", "0.52"})
+        self.assertEqual(terms, {"jev_graph.py", "src/main.rs"})
+
+    def test_build_state_keeps_cited_rows(self):
+        result = "x" * 1500 + "\n" + "{'count': 18695}\n" + "y" * 1500
+        action = hook.make_action("Bash", "psql -c 'select …'", result, False)
+        state, _ = hook.build_state("task", [action], "Ingest has 18,695 done.", hook.state_token_budget())
+        self.assertIn("18695", state["actions"][0]["result"])
+
     def test_inputs_clip_shorter_than_results(self):
         action = hook.make_action("Bash", "A" * 1000 + "Z" * 1000, "B" * 1000 + "Y" * 1000, False)
         self.assertLess(len(action["input"]), 400)
@@ -432,6 +462,8 @@ class HookRunTests(unittest.TestCase):
         self.assertEqual(self.log_lines()[-1]["flagged"], {"unverified": ["unverified_s1"], "palter": ["palter_a1"]})
 
     def test_same_threshold_every_attempt_and_cap_of_three(self):
+        # The same claims every time: allow them to be called out more than once, so only the cap ends the run.
+        self.env["JEV_NO_BULLSHIT_MAX_CALLOUTS"] = "5"
         self.jev.answer = lambda q, body: 0.65 if q.startswith("unverified") else (0.55 if q.startswith("weasel") else 0.0)
         first = self.run_hook()
         self.assertIn("Unverified claim", first["reason"])
@@ -455,12 +487,43 @@ class HookRunTests(unittest.TestCase):
     def test_fresh_turn_resets_counters(self):
         self.jev.answer = lambda q, body: 0.9
         self.run_hook()
-        self.run_hook(active=True)
+        self.run_hook(active=True, summary="Rewrote the login check.")
         self.assertEqual(self.counters()["attempt"], 2)
         self.jev.answer = lambda q, body: 0.0
         self.run_hook(active=False)
         self.assertEqual(self.counters()["attempt"], 0)
+        self.assertEqual(self.counters()["callouts"], {})
         self.assertEqual(self.log_lines()[-1]["thresholds"]["unverified"], 0.6)
+
+    def test_same_sentence_is_called_out_once(self):
+        self.jev.answer = lambda q, body: 0.9 if q.startswith("unverified") else 0.0
+        self.assertIn("All tests are passing", self.run_hook(summary="All tests are passing.")["reason"])
+        # The revision repeats the flagged sentence and adds a new one: only the new one is called out.
+        second = self.run_hook(active=True, summary="All tests are passing. The deploy finished.")
+        self.assertIn("The deploy finished", second["reason"])
+        self.assertNotIn("All tests are passing", second["reason"])
+        self.assertEqual(self.log_lines()[-1]["repeats"], {"unverified": ["unverified_s0"]})
+        # Nothing new: the turn ends.
+        self.assertIsNone(self.run_hook(active=True, summary="All tests are passing."))
+        self.assertFalse(self.log_lines()[-1]["redirected"])
+
+    def test_same_action_is_called_out_once(self):
+        self.jev.answer = lambda q, body: 0.9 if q == "palter_a1" else 0.0
+        self.assertIn("Paltering", self.run_hook()["reason"])
+        self.assertIsNone(self.run_hook(active=True, summary="Answered the other note."))
+        self.assertEqual(self.log_lines()[-1]["repeats"], {"palter": ["palter_a1"]})
+
+    def test_max_callouts_setting(self):
+        self.jev.answer = lambda q, body: 0.9 if q.startswith("unverified") else 0.0
+        self.env["JEV_NO_BULLSHIT_MAX_CALLOUTS"] = "2"
+        self.run_hook()
+        self.assertIn("All tests are passing", self.run_hook(active=True)["reason"])
+        self.assertIsNone(self.run_hook(active=True))
+        for bad in ("0", "-1", "two", ""):
+            with self.subTest(value=bad):
+                self.env["JEV_NO_BULLSHIT_MAX_CALLOUTS"] = bad
+                self.run_hook()
+                self.assertIsNone(self.run_hook(active=True))
 
     def test_codex_input(self):
         self.transcript = codex_rollout(self.home / "r.jsonl")
