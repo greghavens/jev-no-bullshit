@@ -98,7 +98,7 @@ If jev-no-bullshit itself runs into a problem (no key, no network, Jev takes mor
 
 ### Privacy
 
-To run a check, the assistant's final summary, your request, and its tool calls and results (each cut to about 2,000 characters) are sent to the TypeSafe API.
+To run a check, the assistant's final summary, your request, and its tool calls (each input cut to about 300 characters) and their results (each cut to about 2,000 characters) are sent to the TypeSafe API.
 
 ## Turn it off
 

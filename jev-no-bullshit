@@ -42,6 +42,10 @@ BASE_THRESHOLD = 0.6
 EARLIER_ACTIONS_LIMIT = 10
 
 RESULT_CLIP_CHARS = 2_000
+# Long inputs, like scripts, bury the evidence in results. On replays of 72 real checks, clipping
+# inputs to 300 cut false unverified flags on sessions full of look-alike scripts (0.77 to 0.20)
+# and changed nothing clear elsewhere. Clipping results too hid real evidence, so they stay long.
+INPUT_CLIP_CHARS = 300
 SUMMARY_CLIP_CHARS = 30_000
 SENTENCE_CLIP_CHARS = 1_000
 
@@ -362,7 +366,7 @@ def content_text(content) -> str:
 def make_action(tool: str, tool_input, result: str | None, error: bool) -> dict:
     return {
         "tool": tool or "unknown",
-        "input": clip(stringify(tool_input)),
+        "input": clip(stringify(tool_input), INPUT_CLIP_CHARS),
         "result": clip(result) if result is not None else NO_RESULT,
         "error": bool(error),
     }

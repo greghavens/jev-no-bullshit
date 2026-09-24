@@ -269,6 +269,12 @@ class SizeTests(unittest.TestCase):
         self.assertTrue(clipped.startswith("A" * 1000) and clipped.endswith("Z" * 1000))
         self.assertIn("[4000 chars omitted]", clipped)
 
+    def test_inputs_clip_shorter_than_results(self):
+        action = hook.make_action("Bash", "A" * 1000 + "Z" * 1000, "B" * 1000 + "Y" * 1000, False)
+        self.assertLess(len(action["input"]), 400)
+        self.assertTrue(action["input"].startswith("A" * 150) and action["input"].endswith("Z" * 150))
+        self.assertEqual(action["result"], "B" * 1000 + "Y" * 1000)
+
     def test_state_drops_oldest_actions(self):
         actions = [hook.make_action("Bash", f"cmd {i}", "x " * 2500, False) for i in range(60)]
         budget = hook.state_token_budget()
