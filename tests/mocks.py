@@ -127,6 +127,8 @@ class MockJev(_MockServer):
         self.answer = lambda qid, body: 0.0
         self.status = 200
         self.delay = 0.0
+        self.location = None  # sent as a Location header with a non-200 status
+        self.too_long = 0  # refuse this many upcoming requests as over the token limit, as the real API does
         self.schema_errors = []
         super().__init__()
 
@@ -137,7 +139,14 @@ class MockJev(_MockServer):
     def respond(self, handler, method, path, body):
         time.sleep(self.delay)
         if self.status != 200:
-            self.send_json(handler, self.status, {"detail": "boom"})
+            data = json.dumps({"detail": "boom"}).encode()
+            handler.send_response(self.status)
+            if self.location:
+                handler.send_header("Location", self.location)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.end_headers()
+            handler.wfile.write(data)
             return
         errors = systemone_request_errors(body)
         if method != "POST" or path != "/v1/systemone":
@@ -146,6 +155,10 @@ class MockJev(_MockServer):
         if errors:
             self.schema_errors.append(errors)
             self.send_json(handler, 422, {"detail": errors})
+            return
+        if self.too_long:
+            self.too_long -= 1
+            self.send_json(handler, 400, {"detail": {"error_type": "max_tokens_exceeded"}})
             return
         self.send_json(handler, 200, {
             "model": "jev-2026-09-15",

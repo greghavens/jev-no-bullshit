@@ -6,7 +6,7 @@
     {
       "name": "jev-no-bullshit",
       "source": "./",
-      "description": "Stop hook that asks Jev whether the model's final summary bullshits about what it did, and sends the model back once to restate it plainly."
+      "description": "Stop hook that asks Jev whether the model's final summary bullshits about what it did, and sends the model back to restate it plainly."
     }
   ]
 }

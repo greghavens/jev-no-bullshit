@@ -136,6 +136,8 @@ Use this or the plugin, not both. With both, every check runs twice.
 - `~/.jev-no-bullshit/log.jsonl`: one line per check, with the time, session, attempt, every question's score, the thresholds, what was flagged, and whether it sent the assistant back.
 - `~/.jev-no-bullshit/state/<session>.json`: redirect counters for the current answer.
 
+The folder is created readable only by you. The key is only ever sent over https.
+
 ### How it decides
 
 Each sentence of the summary is checked for unverified claims, weasel words and empty rhetoric. Each tool call is checked for paltering. A problem is flagged when Jev's yes-probability is above 0.5. If the same type of problem is flagged again for the same answer, the bar rises to 0.75 and then 0.875. The full design is in [docs/jev-no-bullshit-spec.md](docs/jev-no-bullshit-spec.md).

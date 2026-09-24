@@ -17,8 +17,10 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -35,9 +37,19 @@ MAX_REDIRECTS = 3
 BASE_THRESHOLD = 0.5
 
 RESULT_CLIP_CHARS = 2_000
-STATE_CHAR_LIMIT = 100_000
-TOTAL_TOKEN_BUDGET = 64_000
-CHARS_PER_TOKEN = 4  # rough estimate used only for the 64k question budget
+SUMMARY_CLIP_CHARS = 30_000
+SENTENCE_CLIP_CHARS = 1_000
+
+# Jev's limits: 32k tokens for the state plus the longest question, 64k for the state plus all
+# questions. Requests over them are refused with HTTP 400 max_tokens_exceeded.
+STATE_AND_QUESTION_TOKEN_LIMIT = 32_000
+REQUEST_TOKEN_LIMIT = 64_000
+# Measured against the live API: fixed tokens per request, per question, and per part of an object state.
+REQUEST_OVERHEAD_TOKENS = 260
+QUESTION_OVERHEAD_TOKENS = 7
+KEY_OVERHEAD_TOKENS = 5
+ITEM_OVERHEAD_TOKENS = 3
+CONTAINER_OVERHEAD_TOKENS = 2
 
 # Bullshit types, in the order they are reported.
 UNVERIFIED = "unverified"
@@ -76,6 +88,16 @@ def home_dir() -> Path:
     return Path.home() / ".jev-no-bullshit"
 
 
+def private_dir(sub: str = "") -> Path:
+    """Create ~/.jev-no-bullshit[/sub] owner-only: the log and state hold task and summary text."""
+    path = home_dir()
+    path.mkdir(mode=0o700, exist_ok=True)
+    if sub:
+        path = path / sub
+        path.mkdir(mode=0o700, exist_ok=True)
+    return path
+
+
 def state_path(session_id: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id or "unknown")
     return home_dir() / "state" / f"{safe}.json"
@@ -103,8 +125,8 @@ def load_counters(session_id: str, stop_hook_active: bool) -> dict:
 
 
 def save_counters(session_id: str, counters: dict) -> None:
+    private_dir("state")
     path = state_path(session_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(counters))
     os.replace(tmp, path)
@@ -112,13 +134,13 @@ def save_counters(session_id: str, counters: dict) -> None:
 
 def log(entry: dict) -> None:
     try:
-        path = home_dir() / "log.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = private_dir() / "log.jsonl"
         record = {"time": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"), **entry}
         with path.open("a") as f:
             f.write(json.dumps(record) + "\n")
-    except OSError:
-        pass
+    except OSError as error:
+        # Nowhere to log: stderr at least shows up in the hook's debug output.
+        print(f"jev-no-bullshit: cannot write log ({error}): {json.dumps(entry)}", file=sys.stderr)
 
 
 def threshold(times_flagged: int) -> float:
@@ -435,50 +457,177 @@ def read_transcript(path: str | None, parse) -> tuple[str, list[dict], str | Non
 # Jev state and questions
 
 
-def build_state(task: str, actions: list[dict], summary: str) -> tuple[dict, int]:
-    """Return (state, dropped) where dropped counts the oldest actions left out to fit the size cap."""
-    state = {"task": clip(task, 8_000), "actions": list(actions), "summary": summary, "sentences": split_sentences(summary)}
-    dropped = 0
-    while state["actions"] and len(json.dumps(state, ensure_ascii=False)) > STATE_CHAR_LIMIT:
-        state["actions"].pop(0)
-        dropped += 1
-    if len(json.dumps(state, ensure_ascii=False)) > STATE_CHAR_LIMIT:
-        # A huge summary on its own: keep its head and tail, and clip each sentence.
-        state["summary"] = clip(summary, STATE_CHAR_LIMIT // 3)
-        state["sentences"] = [clip(s, 1_000) for s in state["sentences"]]
-        while state["sentences"] and len(json.dumps(state, ensure_ascii=False)) > STATE_CHAR_LIMIT:
-            state["sentences"].pop()
-    return state, dropped
+# TypeSafe doesn't publish Jev's tokenizer. Its counts match Qwen3.5's on English and code, but
+# that tokenizer isn't in the standard library, so estimate from the pieces it splits text into.
+# Letter runs are split at case changes, so a random ID counts as many short pieces. The weights are
+# fitted to Qwen3.5's counts on real tool calls. Other characters use Jev's measured counts: 1 for each
+# in the Basic Multilingual Plane (accents, dashes, CJK), 2 above it (emoji). On states of 30 or more
+# strings the estimate lands within 10% of the true count (median 1.01x), and within 4% on the live API.
+_TOKEN_PIECE_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]|[ \t\n\r\f\v]+|[!-/:-@\[-`{-~]+|[^\x00-\x7f]")
+SHORT_WORD_TOKENS = 1.13  # a letter piece of up to 3 letters
+LONG_WORD_TOKENS_PER_LETTER = 0.17
+DIGIT_TOKENS = 1.0
+WHITESPACE_RUN_TOKENS = 0.39
+PUNCTUATION_TOKENS_PER_CHAR = 0.57
+BMP_CHAR_TOKENS = 1.0
+ASTRAL_CHAR_TOKENS = 2.0
+# Budgets are divided by this so an estimate that runs a little low still fits: the live API came in
+# at most 3.5% above the estimate on full states.
+ESTIMATE_MARGIN = 1.05
+# If Jev refuses anyway, the state is unusual for the estimator (such as long random IDs), so the retry
+# cuts every budget to this fraction rather than shaving a few percent and getting refused again.
+RETRY_BUDGET_SCALE = 0.8
 
 
-def build_questions(state: dict) -> tuple[dict, int]:
-    """Return (questions, palter questions dropped for the 64k budget)."""
+def estimate_tokens(value) -> float:
+    """Estimate Jev's token count for a state value, the way Jev renders objects."""
+    if isinstance(value, dict):
+        return CONTAINER_OVERHEAD_TOKENS + sum(
+            KEY_OVERHEAD_TOKENS + estimate_tokens(k) + estimate_tokens(v) for k, v in value.items()
+        )
+    if isinstance(value, list):
+        return CONTAINER_OVERHEAD_TOKENS + sum(ITEM_OVERHEAD_TOKENS + estimate_tokens(v) for v in value)
+    tokens = 0.0
+    for piece in _TOKEN_PIECE_RE.findall(value if isinstance(value, str) else json.dumps(value)):
+        first = piece[0]
+        if not first.isascii():
+            tokens += ASTRAL_CHAR_TOKENS if ord(first) > 0xFFFF else BMP_CHAR_TOKENS
+        elif first.isalpha():
+            tokens += SHORT_WORD_TOKENS if len(piece) <= 3 else LONG_WORD_TOKENS_PER_LETTER * len(piece)
+        elif first.isdigit():
+            tokens += DIGIT_TOKENS
+        elif first.isspace():
+            tokens += WHITESPACE_RUN_TOKENS
+        else:
+            tokens += PUNCTUATION_TOKENS_PER_CHAR * len(piece)
+    return tokens
+
+
+def question_tokens(question: dict) -> float:
+    return QUESTION_OVERHEAD_TOKENS + estimate_tokens(question["instructions"])
+
+
+def state_token_budget(scale: float = 1.0) -> float:
+    """Tokens the state may use: the 32k limit less the request overhead and the longest question."""
+    # Index 999: a full state holds about a thousand of the smallest actions at most, and an extra digit
+    # is one token, well inside ESTIMATE_MARGIN.
+    longest = max(question_tokens({"instructions": text.format(i=999)}) for text in INSTRUCTIONS.values())
+    return STATE_AND_QUESTION_TOKEN_LIMIT * scale / ESTIMATE_MARGIN - REQUEST_OVERHEAD_TOKENS - longest
+
+
+def build_state(task: str, actions: list[dict], summary: str, budget: float) -> tuple[dict, int]:
+    """Return (state, dropped) where dropped counts the oldest actions left out to fit the token budget."""
+    state = {"task": clip(task, 8_000), "actions": [], "summary": summary, "sentences": split_sentences(summary)}
+    room = budget - estimate_tokens(state)
+    if room < 0:
+        # A huge summary on its own: keep its head and tail, clip each sentence, and keep what fits.
+        state["summary"] = clip(summary, SUMMARY_CLIP_CHARS)
+        sentences = [clip(s, SENTENCE_CLIP_CHARS) for s in state["sentences"]]
+        state["sentences"] = []
+        room = budget - estimate_tokens(state)
+        for sentence in sentences:
+            cost = ITEM_OVERHEAD_TOKENS + estimate_tokens(sentence)
+            if cost > room:
+                break
+            state["sentences"].append(sentence)
+            room -= cost
+    kept = 0
+    for action in reversed(actions):  # newest first, so the oldest are dropped
+        cost = ITEM_OVERHEAD_TOKENS + estimate_tokens(action)
+        if cost > room:
+            break
+        room -= cost
+        kept += 1
+    state["actions"] = actions[len(actions) - kept :]
+    return state, len(actions) - kept
+
+
+def build_questions(state: dict, scale: float = 1.0) -> tuple[dict, int, int]:
+    """Return (questions, palter questions dropped, sentence questions dropped) to fit the 64k budget.
+
+    Paltering questions for the oldest actions go first, then sentence questions from the end.
+    """
     questions = {}
     for i in range(len(state["sentences"])):
         for t in SENTENCE_TYPES:
             questions[f"{t}_s{i}"] = {"type": "noul", "instructions": INSTRUCTIONS[t].format(i=i)}
-    palter = {
-        f"{PALTER}_a{j}": {"type": "noul", "instructions": INSTRUCTIONS[PALTER].format(i=j)}
-        for j in range(len(state["actions"]))
-    }
+    palter_ids = [f"{PALTER}_a{j}" for j in range(len(state["actions"]))]
+    for j, qid in enumerate(palter_ids):
+        questions[qid] = {"type": "noul", "instructions": INSTRUCTIONS[PALTER].format(i=j)}
 
-    def tokens(qs: dict) -> int:
-        chars = len(json.dumps(state, ensure_ascii=False)) + len(json.dumps(qs))
-        return chars // CHARS_PER_TOKEN
+    room = REQUEST_TOKEN_LIMIT * scale / ESTIMATE_MARGIN - REQUEST_OVERHEAD_TOKENS - estimate_tokens(state)
+    room -= sum(question_tokens(q) for q in questions.values())
+    drop_order = palter_ids + [qid for qid in reversed(questions) if not qid.startswith(PALTER)]
+    dropped = []
+    for qid in drop_order:
+        if room >= 0:
+            break
+        room += question_tokens(questions.pop(qid))
+        dropped.append(qid)
+    dropped_palters = sum(1 for qid in dropped if qid.startswith(PALTER))
+    return questions, dropped_palters, len(dropped) - dropped_palters
 
-    dropped = 0
-    palter_ids = list(palter)
-    while palter_ids and tokens({**questions, **palter}) > TOTAL_TOKEN_BUDGET:
-        del palter[palter_ids.pop(0)]  # oldest actions first
-        dropped += 1
-    return {**questions, **palter}, dropped
+
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 
-def ask_jev(state: dict, questions: dict, api_key: str) -> dict:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: urllib would resend the Authorization header to wherever they point."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None  # the 3xx surfaces as an HTTPError, which fails open
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def jev_url() -> str:
+    """The Jev endpoint. The API key is sent to it, so only https is allowed, except to this machine."""
     base_url = (os.environ.get("TYPESAFE_BASE_URL", "").strip() or DEFAULT_BASE_URL).rstrip("/")
+    parts = urllib.parse.urlsplit(base_url)
+    if parts.scheme != "https" and not (parts.scheme == "http" and parts.hostname in _LOCAL_HOSTS):
+        raise ValueError(f"TYPESAFE_BASE_URL must be an https URL, got {base_url!r}")
+    return base_url + SYSTEM_ONE_PATH
+
+
+class JevTooLong(ValueError):
+    """Jev refused the request as over its token limits (HTTP 400 max_tokens_exceeded)."""
+
+
+def ask_jev(state: dict, questions: dict, api_key: str, deadline: float) -> dict:
+    """POST to Jev, giving up at the time.monotonic() deadline.
+
+    urlopen's timeout applies to each socket operation (and not to DNS), so a slow or trickling
+    response could run far past it. The call runs in a daemon thread that is abandoned on timeout.
+    """
+    outcome: dict = {}
+
+    def call():
+        try:
+            outcome["response"] = _post_jev(state, questions, api_key)
+        except urllib.error.HTTPError as error:
+            body = error.read()[:500].decode(errors="replace")
+            if error.code == 400 and "max_tokens_exceeded" in body:
+                outcome["error"] = JevTooLong(f"HTTP 400: {body}")
+            else:
+                outcome["error"] = ValueError(f"HTTP {error.code}: {body}")
+        except BaseException as error:  # re-raised in the calling thread
+            outcome["error"] = error
+
+    worker = threading.Thread(target=call, daemon=True)
+    worker.start()
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive():
+        raise TimeoutError(f"no answer within {JEV_TIMEOUT_SECONDS:g} seconds")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["response"]
+
+
+def _post_jev(state: dict, questions: dict, api_key: str) -> dict:
     body = json.dumps({"state": state, "model": JEV_MODEL, "questions": questions}).encode()
     request = urllib.request.Request(
-        base_url + SYSTEM_ONE_PATH,
+        jev_url(),
         data=body,
         method="POST",
         headers={
@@ -488,7 +637,7 @@ def ask_jev(state: dict, questions: dict, api_key: str) -> dict:
             "User-Agent": "jev-no-bullshit",
         },
     )
-    with urllib.request.urlopen(request, timeout=JEV_TIMEOUT_SECONDS) as response:
+    with _OPENER.open(request, timeout=JEV_TIMEOUT_SECONDS) as response:
         return json.loads(response.read())
 
 
@@ -584,32 +733,43 @@ def run(hook_input: dict) -> dict | None:
     )
     model = (hook_input.get("model") if is_codex else None) or transcript_model or "the model"
 
-    state, dropped_actions = build_state(task, actions, summary)
-    questions, dropped_palters = build_questions(state)
     thresholds = {t: threshold(counters["flags"][t]) for t in TYPES}
-    base.update(
-        thresholds=thresholds,
-        dropped_actions=dropped_actions,
-        dropped_palter_questions=dropped_palters,
-        missing_tool_results=pending,
-    )
-    if not questions:
-        log({**base, "skipped": "no sentences or actions to ask about", "summary": summary})
-        return None
+    base.update(thresholds=thresholds, missing_tool_results=pending)
+    deadline = time.monotonic() + JEV_TIMEOUT_SECONDS
+    # The token count is an estimate; if Jev still finds the request too long, retry once with a smaller budget.
+    for scale in (1.0, RETRY_BUDGET_SCALE):
+        state, dropped_actions = build_state(task, actions, summary, state_token_budget(scale))
+        questions, dropped_palters, dropped_sentence_qs = build_questions(state, scale)
+        base.update(
+            dropped_actions=dropped_actions,
+            dropped_palter_questions=dropped_palters,
+            dropped_sentence_questions=dropped_sentence_qs,
+            estimated_tokens=round(
+                REQUEST_OVERHEAD_TOKENS + estimate_tokens(state) + sum(map(question_tokens, questions.values()))
+            ),
+        )
+        if not questions:
+            log({**base, "skipped": "no sentences or actions to ask about", "summary": summary})
+            return None
+        if base.get("refused_estimated_tokens", float("inf")) <= base["estimated_tokens"]:
+            # Everything already fit the smaller budget, so the refusal isn't about size: don't resend it.
+            log({**base, "error": f"Jev call failed: {type(refused).__name__}: {refused}", "summary": summary})
+            return None
+        try:
+            response = ask_jev(state, questions, api_key, deadline)
+            values = noul_values(response)
+            break
+        except (urllib.error.URLError, OSError, ValueError, TypeError) as error:
+            if isinstance(error, JevTooLong) and scale == 1.0:
+                # Jev's refusal gives no count, so the estimate it refused is what to recalibrate from.
+                base["refused_estimated_tokens"] = base["estimated_tokens"]
+                refused = error
+                continue
+            log({**base, "error": f"Jev call failed: {type(error).__name__}: {error}", "summary": summary})
+            return None
 
-    try:
-        response = ask_jev(state, questions, api_key)
-        values = noul_values(response)
-    except (urllib.error.URLError, OSError, ValueError, TypeError) as error:
-        detail = str(error)
-        if isinstance(error, urllib.error.HTTPError):
-            try:
-                detail = f"HTTP {error.code}: {error.read()[:500].decode(errors='replace')}"
-            except OSError:
-                pass
-        log({**base, "error": f"Jev call failed: {type(error).__name__}: {detail}", "summary": summary})
-        return None
-
+    # Answers without a numeric noul are ignored; log them, or an API change would silently flag nothing.
+    unanswered = sorted(set(questions) - set(values))
     flagged = find_flags(values, thresholds)
     capped = bool(flagged) and counters["attempt"] >= MAX_REDIRECTS
     redirect = bool(flagged) and not capped
@@ -619,6 +779,7 @@ def run(hook_input: dict) -> dict | None:
             "jev_model": response.get("model"),
             "usage": response.get("usage"),
             "answers": values,
+            **({"unanswered": unanswered} if unanswered else {}),
             "flagged": flagged,
             "redirected": redirect,
             "capped": capped,

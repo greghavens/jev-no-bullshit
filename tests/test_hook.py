@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -254,28 +255,64 @@ class SizeTests(unittest.TestCase):
         self.assertIn("[4000 chars omitted]", clipped)
 
     def test_state_drops_oldest_actions(self):
-        actions = [hook.make_action("Bash", f"cmd {i}", "x" * 5000, False) for i in range(60)]
-        state, dropped = hook.build_state("task", actions, "Did it.")
-        self.assertLessEqual(len(json.dumps(state, ensure_ascii=False)), hook.STATE_CHAR_LIMIT)
+        actions = [hook.make_action("Bash", f"cmd {i}", "x " * 2500, False) for i in range(60)]
+        budget = hook.state_token_budget()
+        state, dropped = hook.build_state("task", actions, "Did it.", budget)
+        self.assertLessEqual(hook.estimate_tokens(state), budget)
         self.assertGreater(dropped, 0)
         self.assertEqual(state["actions"][-1]["input"], "cmd 59")
         self.assertEqual(state["actions"][0]["input"], f"cmd {dropped}")
 
-    def test_budget_drops_oldest_palter_questions(self):
+    def test_dense_results_are_budgeted_by_tokens_not_characters(self):
+        # Hex runs about 1.1 characters per token: 60 clipped results of it are ~110k tokens but only ~120k characters.
+        hexes = "".join("0123456789abcdef"[(i * 7) % 16] for i in range(5000))
+        actions = [hook.make_action("Bash", f"sha {i}", hexes, False) for i in range(60)]
+        state, dropped = hook.build_state("task", actions, "Did it.", hook.state_token_budget())
+        self.assertGreater(dropped, 40)
+        self.assertLess(hook.estimate_tokens(state), hook.STATE_AND_QUESTION_TOKEN_LIMIT)
+
+    def test_huge_summary_keeps_leading_sentences(self):
+        summary = " ".join(f"Sentence number {i} is here." for i in range(20_000))
+        budget = hook.state_token_budget()
+        state, _ = hook.build_state("task", [], summary, budget)
+        self.assertLessEqual(hook.estimate_tokens(state), budget)
+        self.assertEqual(state["sentences"][0], "Sentence number 0 is here.")
+        self.assertLess(len(state["sentences"]), 20_000)
+
+    def test_estimates_match_jev(self):
+        # Token counts measured from usage.input_tokens on the live API. The per-character and per-structure
+        # counts are exact rules; accuracy on ordinary text is checked on real content in test_live.py.
+        action = {"tool": "Bash", "input": "npm test", "result": "ok", "error": False}
+        measured = [
+            ("\U0001f642" * 20, 40),
+            ("\u65e5\u672c\u8a9e" * 20, 60),
+            ("\u2014" * 20, 20),
+            ({"task": "t", "actions": [action] * 20, "summary": "s", "sentences": ["s"]}, 713),
+            ({"s": ["one", "two", "three", "four"] * 10}, 166),
+        ]
+        for value, tokens in measured:
+            with self.subTest(value=str(value)[:30]):
+                self.assertAlmostEqual(hook.estimate_tokens(value) / tokens, 1.0, delta=0.05)
+
+    def test_budget_drops_oldest_palter_questions_then_last_sentences(self):
         actions = [hook.make_action("Bash", f"cmd {i}", "ok", False) for i in range(10)]
-        state, _ = hook.build_state("task", actions, "One. Two.")
-        full, dropped = hook.build_questions(state)
-        self.assertEqual((len(full), dropped), (16, 0))
-        original = hook.TOTAL_TOKEN_BUDGET
-        try:
-            hook.TOTAL_TOKEN_BUDGET = (len(json.dumps(state)) + len(json.dumps(full))) // hook.CHARS_PER_TOKEN - 60
-            trimmed, dropped = hook.build_questions(state)
-        finally:
-            hook.TOTAL_TOKEN_BUDGET = original
-        self.assertGreater(dropped, 0)
+        state, _ = hook.build_state("task", actions, "One. Two.", hook.state_token_budget())
+        full, palters, sentences = hook.build_questions(state)
+        self.assertEqual((len(full), palters, sentences), (16, 0, 0))
+        need = hook.REQUEST_OVERHEAD_TOKENS + hook.estimate_tokens(state) + sum(map(hook.question_tokens, full.values()))
+        with mock.patch.object(hook, "REQUEST_TOKEN_LIMIT", (need - 60) * hook.ESTIMATE_MARGIN):
+            trimmed, palters, sentences = hook.build_questions(state)
+        self.assertEqual(sentences, 0)
+        self.assertGreater(palters, 0)
         self.assertNotIn("palter_a0", trimmed)
         self.assertIn("palter_a9", trimmed)
         self.assertIn("unverified_s1", trimmed)
+        with mock.patch.object(hook, "REQUEST_TOKEN_LIMIT", (need - 400) * hook.ESTIMATE_MARGIN):
+            trimmed, palters, sentences = hook.build_questions(state)
+        self.assertEqual(palters, 10)
+        self.assertGreater(sentences, 0)
+        self.assertNotIn("rhetoric_s1", trimmed)
+        self.assertIn("unverified_s0", trimmed)
 
 
 # ---------------------------------------------------------------------------
@@ -430,8 +467,8 @@ class HookRunTests(unittest.TestCase):
         self.assertIsNone(self.run_hook())
         self.assertIn("HTTP 500", self.log_lines()[-1]["error"])
 
-    def test_fails_open_on_schema_rejection(self):
-        # The stand-in answers 422 like the real API; the hook logs the server's message and lets the turn end.
+    def test_fails_open_on_wrong_endpoint(self):
+        # The hook logs the server's status and message and lets the turn end.
         self.env["TYPESAFE_BASE_URL"] = self.jev.url + "/wrong-prefix"
         self.assertIsNone(self.run_hook())
         self.assertIn("HTTP 404", self.log_lines()[-1]["error"])
@@ -442,26 +479,115 @@ class HookRunTests(unittest.TestCase):
 
     def test_fails_open_on_timeout(self):
         self.jev.delay = 1.0
-        original = hook.JEV_TIMEOUT_SECONDS
-        os.environ["TYPESAFE_BASE_URL"] = self.jev.url
-        os.environ["TYPESAFE_API_KEY"] = "test-key"
-        os.environ["HOME"], old_home = str(self.home), os.environ.get("HOME")
-        try:
-            hook.JEV_TIMEOUT_SECONDS = 0.2
+        env = {"TYPESAFE_BASE_URL": self.jev.url, "TYPESAFE_API_KEY": "test-key", "HOME": str(self.home)}
+        with mock.patch.dict(os.environ, env), mock.patch.object(hook, "JEV_TIMEOUT_SECONDS", 0.2):
             output = hook.run({"session_id": "sess-1", "transcript_path": str(self.transcript),
                                "stop_hook_active": False, "last_assistant_message": "Done."})
-        finally:
-            hook.JEV_TIMEOUT_SECONDS = original
-            for key in ("TYPESAFE_BASE_URL", "TYPESAFE_API_KEY"):
-                os.environ.pop(key, None)
-            if old_home is not None:
-                os.environ["HOME"] = old_home
         self.assertIsNone(output)
         self.assertIn("Jev call failed", self.log_lines()[-1]["error"])
 
+    def test_timeout_bounds_the_whole_call(self):
+        # urlopen's timeout is per socket operation; a call that keeps trickling must still stop at the limit.
+        def slow_post(*args):
+            time.sleep(2)
+            return {"answers": {}}
 
-if __name__ == "__main__":
-    unittest.main()
+        env = {"TYPESAFE_API_KEY": "test-key", "HOME": str(self.home)}
+        with mock.patch.dict(os.environ, env), mock.patch.object(hook, "JEV_TIMEOUT_SECONDS", 0.2), \
+                mock.patch.object(hook, "_post_jev", slow_post):
+            start = time.monotonic()
+            output = hook.run({"session_id": "sess-1", "transcript_path": str(self.transcript),
+                               "stop_hook_active": False, "last_assistant_message": "Done."})
+            elapsed = time.monotonic() - start
+        self.assertIsNone(output)
+        self.assertLess(elapsed, 1.5)
+        self.assertIn("TimeoutError", self.log_lines()[-1]["error"])
+
+    def test_key_is_never_sent_over_plain_http_to_another_host(self):
+        self.env["TYPESAFE_BASE_URL"] = "http://api.typesafe.ai"
+        self.assertIsNone(self.run_hook())
+        self.assertIn("must be an https URL", self.log_lines()[-1]["error"])
+
+    def test_redirects_are_not_followed(self):
+        # Following one would resend the Authorization header to the redirect target.
+        self.jev.status, self.jev.location = 302, self.jev.url + "/elsewhere"
+        self.assertIsNone(self.run_hook())
+        self.assertEqual([r["path"] for r in self.jev.requests], ["/v1/systemone"])
+        self.assertIn("HTTP 302", self.log_lines()[-1]["error"])
+
+    def test_unanswered_questions_are_logged(self):
+        self.jev.answer = lambda q, body: None if q.startswith("palter") else 0.0
+        self.assertIsNone(self.run_hook())
+        self.assertEqual(self.log_lines()[-1]["unanswered"], ["palter_a0", "palter_a1"])
+
+    def test_unwritable_log_goes_to_stderr(self):
+        (self.home / ".jev-no-bullshit").write_text("not a directory")
+        self.env["TYPESAFE_API_KEY"] = ""
+        proc = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True, text=True, env=self.env,
+                              input=json.dumps({"session_id": "s", "last_assistant_message": "Done."}))
+        self.assertEqual((proc.returncode, proc.stdout), (0, ""))
+        self.assertIn("cannot write log", proc.stderr)
+
+    def use_full_transcript(self):
+        """A transcript whose actions fill the state budget, so a smaller budget drops some."""
+        result = "Traceback (most recent call last):\n" + "  File \"src/app.py\", line 12, in handler\n" * 60
+        extra = []
+        for n in range(40):
+            extra.append({"type": "assistant", "message": {"role": "assistant", "model": "claude-opus-5-5", "content": [
+                {"type": "tool_use", "id": f"big{n}", "name": "Bash", "input": {"command": f"pytest -k case{n}"}}]}})
+            extra.append({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": f"big{n}", "content": result, "is_error": True}]}})
+        self.transcript = claude_transcript(self.home / "t.jsonl", extra=extra)
+
+    def test_retries_smaller_when_jev_says_too_long(self):
+        self.use_full_transcript()
+        self.jev.too_long = 1
+        self.jev.answer = lambda q, body: 0.9 if q == "unverified_s1" else 0.1
+        self.assertEqual(self.run_hook()["decision"], "block")
+        self.assertEqual(len(self.jev.calls), 2)
+        self.assertLess(len(self.jev.calls[1]["body"]["state"]["actions"]), len(self.jev.calls[0]["body"]["state"]["actions"]))
+        log = self.log_lines()[-1]
+        self.assertLess(log["estimated_tokens"], log["refused_estimated_tokens"])
+        self.assertTrue(log["redirected"])
+
+    def test_fails_open_when_still_too_long(self):
+        self.use_full_transcript()
+        self.jev.too_long = 2
+        self.assertIsNone(self.run_hook())
+        self.assertEqual(len(self.jev.calls), 2)
+        log = self.log_lines()[-1]
+        self.assertIn("JevTooLong: HTTP 400", log["error"])
+        self.assertLess(log["estimated_tokens"], log["refused_estimated_tokens"])
+
+    def test_small_request_refused_as_too_long_is_not_resent(self):
+        self.jev.too_long = 1
+        self.assertIsNone(self.run_hook())
+        self.assertEqual(len(self.jev.calls), 1)
+        log = self.log_lines()[-1]
+        self.assertIn("JevTooLong: HTTP 400", log["error"])
+        self.assertEqual(log["estimated_tokens"], log["refused_estimated_tokens"])
+
+    def test_files_are_private(self):
+        self.run_hook()
+        for path in (self.home / ".jev-no-bullshit", self.home / ".jev-no-bullshit" / "state"):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o700, path)
+
+
+class JevUrlTests(unittest.TestCase):
+    def url(self, base):
+        with mock.patch.dict(os.environ, {"TYPESAFE_BASE_URL": base}):
+            return hook.jev_url()
+
+    def test_allowed(self):
+        self.assertEqual(self.url(""), "https://api.typesafe.ai/v1/systemone")
+        self.assertEqual(self.url("https://proxy.example/"), "https://proxy.example/v1/systemone")
+        for local in ("http://localhost:8080", "http://127.0.0.1:1", "http://[::1]:1"):
+            self.assertTrue(self.url(local).startswith(local))
+
+    def test_rejected(self):
+        for base in ("http://api.typesafe.ai", "http://localhost.evil.example", "ftp://x", "api.typesafe.ai"):
+            with self.subTest(base=base), self.assertRaises(ValueError):
+                self.url(base)
 
 
 # ---------------------------------------------------------------------------
@@ -473,8 +599,11 @@ class SystemOneSchemaTests(unittest.TestCase):
         return {"state": {"task": "t"}, "model": "jev-latest", "questions": {"q": {"type": "noul", "instructions": "Is it?"}}}
 
     def test_hook_request_shape_is_valid(self):
-        state, _ = hook.build_state("Fix it", [{"tool": "Bash", "input": "npm test", "result": "ok", "error": False}], "Done. It works.")
-        questions, _ = hook.build_questions(state)
+        state, _ = hook.build_state(
+            "Fix it", [{"tool": "Bash", "input": "npm test", "result": "ok", "error": False}], "Done. It works.",
+            hook.state_token_budget(),
+        )
+        questions, _, _ = hook.build_questions(state)
         body = {"state": state, "model": hook.JEV_MODEL, "questions": questions}
         self.assertEqual(systemone_request_errors(json.loads(json.dumps(body))), [])
 
@@ -492,3 +621,7 @@ class SystemOneSchemaTests(unittest.TestCase):
         for body in bad:
             with self.subTest(body=body):
                 self.assertNotEqual(systemone_request_errors(body), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
