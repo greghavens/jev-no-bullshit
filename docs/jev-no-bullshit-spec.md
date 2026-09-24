@@ -24,9 +24,9 @@ Each check is one Jev call. A turn is checked after the model's first answer and
 
 ## Threshold
 
-A question is flagged when Jev's yes-probability is above 0.5, and the bar is the same on every attempt. The cap of 3 redirects is what ends a run of redirects, and it stays below Claude Code's own limit of 8 consecutive Stop blocks.
+A question is flagged when Jev's yes-probability is above 0.6, and the bar is the same on every attempt. The cap of 3 redirects is what ends a run of redirects, and it stays below Claude Code's own limit of 8 consecutive Stop blocks.
 
-0.5 means a problem is flagged whenever Jev thinks it is more likely than not. An earlier version used 0.73, chosen by replaying real checks: with the questions below, every question in the 9 checks from the first day of use scored 0.45 or less, including the 11 sentences and actions the old questions had wrongly flagged, while planted problems (a claimed test run that never happened, a failed test run reported as passing, hedged and promotional sentences) scored 0.79 to 0.97. In use, 0.73 let a real false claim through: a reply said the running session wasn't using the new plugin version when it was, and that sentence scored 0.54 for unverified. At 0.5 the margin over the replayed wrong flags is small: they scored up to 0.45, and scores for the same request vary by up to about 0.05 between calls, so some of them may be flagged again. The log records every score, so recheck the threshold against it as more checks accumulate.
+An earlier version used 0.73, chosen by replaying real checks: with the questions below, every question in the 9 checks from the first day of use scored 0.45 or less, including the 11 sentences and actions the old questions had wrongly flagged, while planted problems (a claimed test run that never happened, a failed test run reported as passing, hedged and promotional sentences) scored 0.79 to 0.97. In use, 0.73 let a real false claim through: a reply said the running session wasn't using the new plugin version when it was, and that sentence scored 0.54 for unverified. 0.5 was tried next and flagged too often in use: in one session it redirected three replies in a row, and one of the flagged sentences was true (0.54). 0.6 sits between: it keeps a margin over the replayed wrong flags (up to 0.45; scores for the same request vary by up to about 0.05 between calls), but lets the 0.54 false claim through. The log records every score, so recheck the threshold against it as more checks accumulate.
 
 ## What Jev sees
 
@@ -93,9 +93,11 @@ When a type is flagged, the hook prints this JSON to stdout and exits 0. `reason
 
 The hook module runs the script on `classic.Stop` with `JEV_NO_BULLSHIT_MODULE=1`, before the plain Stop hooks run. It does not block the stop. When the script returns a redirect, the module:
 
-1. Lets the turn end, and redraws the flagged reply's `AssistantMessage` row as one dim line: "Reply withdrawn after the Jev check; the revised reply follows."
-2. When the turn completes, submits the prompt "Jev flagged the last reply. Revise it using the attached notes." with `reason` attached as `context`, which the model reads and the transcript does not show. `systemMessage` is left out; the module's notice replaces it.
-3. Marks the next check as a redirect with `JEV_NO_BULLSHIT_REDIRECT=1`, since a prompt does not set `stop_hook_active`. A prompt from the person resets the redirect count.
+1. Lets the turn end. The flagged reply stays on screen.
+2. When the turn completes, submits `reason` itself as the prompt's text, so the person sees exactly what was flagged. `systemMessage` is left out. The note is not attached as hidden `context`: the engine does not reliably run a plugin's own `prompt.submit` hook for the prompts that plugin submits, so context attached there was lost after the first redirect.
+3. Marks the next check as a redirect with `JEV_NO_BULLSHIT_REDIRECT=1`, since a prompt does not set `stop_hook_active`. A prompt from the person resets the redirect count. The module recognizes its own prompts by their `[jev-no-bullshit]` tag.
+4. Drops the note if the person typed a prompt while the turn ran. Their prompt comes next, and a note about the reply before it would arrive out of order.
+5. Stops redirecting after 3 redirects per prompt from the person, but still runs the script on every reply, so the plain Stop hook always finds its checked mark and stands down.
 
 Claude Code also loads `hooks/hooks.json`. So that each reply is checked once, the module's run records a hash of the reply in `~/.jev-no-bullshit/state/<session_id>.module`, and the plain Stop hook exits quietly for a reply whose hash matches. Where hook modules are off (a rollout flag, off for third-party providers and with telemetry disabled; `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` forces it on), nothing writes that mark and the plain Stop hook redirects as described above. If another Stop hook blocks the same stop, the module does not redirect as well.
 
@@ -136,7 +138,7 @@ Codex's docs confirm the same `hooks.json` shape, with the Stop `timeout` in sec
 - **Fail open**: if the API key is missing, or Jev errors or takes longer than 10 seconds in total, log it and let the turn end. The hook never traps the model.
 - **Key safety**: the API key is only sent over https. `TYPESAFE_BASE_URL` (for testing) may use plain http only for `localhost`, `127.0.0.1` or `::1`.
 - **Private files**: `~/.jev-no-bullshit/` and its `state/` folder are created readable only by the user, since the log holds tasks and summaries.
-- **Log every check**: append one JSON line per check to `~/.jev-no-bullshit/log.jsonl`. Each line holds the time, session ID, tool (claude or codex), attempt number, every question ID with its `noul` value, any questions Jev left unanswered, the thresholds in force, what was flagged, whether it redirected, and the summary. If the log can't be written, the entry goes to stderr instead. After about a week, read the log to see whether 0.5 fires too often or too rarely.
+- **Log every check**: append one JSON line per check to `~/.jev-no-bullshit/log.jsonl`. Each line holds the time, session ID, tool (claude or codex), attempt number, every question ID with its `noul` value, any questions Jev left unanswered, the thresholds in force, what was flagged, whether it redirected, and the summary. If the log can't be written, the entry goes to stderr instead. After about a week, read the log to see whether 0.6 fires too often or too rarely.
 - **Known risk**: tool results go into the state as-is, so text inside them could sway Jev. That's accepted for now.
 
 ## Out of scope

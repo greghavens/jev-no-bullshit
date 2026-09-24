@@ -35,7 +35,7 @@ TRANSCRIPT_WAIT_SECONDS = 3.0
 NO_RESULT = "(no result recorded)"
 
 MAX_REDIRECTS = 3
-BASE_THRESHOLD = 0.5
+BASE_THRESHOLD = 0.6
 # Earlier turns' actions back up claims about work done before the task message. More than this
 # many buries the current turn: on replayed checks, 50 earlier actions cut the scores of planted
 # unverified claims and paltering from over 0.9 to 0.3-0.65, while 10 kept them at 0.79-0.97.
@@ -925,7 +925,7 @@ def run(hook_input: dict) -> dict | None:
         counters["flags"][t] += 1
     save_counters(session_id, counters)
     output = {"decision": "block", "reason": build_reason(flagged, state, dropped_actions)}
-    if is_codex or not module:  # in Claude Code the module draws its own notice
+    if is_codex or not module:  # in Claude Code the module sends the reason itself as a prompt
         output["systemMessage"] = (
             f"Asking {model} to reconsider its response after bullshit detection, attempt #{counters['attempt']}"
         )

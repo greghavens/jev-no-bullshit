@@ -53,7 +53,7 @@ Each time the assistant finishes, jev-no-bullshit checks its summary. If the sum
 
 If it isn't, what you see depends on the tool:
 
-- **Claude Code**: the flagged reply is replaced by one dim line, "Reply withdrawn after the Jev check; the revised reply follows." The plugin then sends the assistant a short prompt, "Jev flagged the last reply. Revise it using the attached notes.", and the note itself goes along as context you don't see. Claude Code labels that prompt as coming from the plugin.
+- **Claude Code**: the flagged reply stays on screen. The plugin then sends the note below to the assistant as a prompt of its own, so you see exactly what was flagged, and the assistant revises. Claude Code labels that prompt as coming from the plugin. If you type a message while the assistant is still working, the plugin drops the note for that reply rather than send it after your message.
 - **Codex**, and Claude Code where plugin hook modules aren't enabled (see below): the assistant is stopped from finishing, and you'll see a line like this:
 
   ```
@@ -73,7 +73,7 @@ It checks its work and writes a new summary, which is checked the same way. The 
 
 ### Hook modules in Claude Code
 
-The withdraw-and-revise behavior uses Claude Code's plugin hook modules, which are in early access. Claude Code turns them on through a rollout flag, which stays off with a third-party model provider (Bedrock, Vertex, a custom `ANTHROPIC_BASE_URL`), with nonessential traffic disabled, or on accounts the rollout hasn't reached. Set `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` to turn them on anyway. Without them the plugin falls back to a plain Stop hook: replies are still checked, the flagged reply stays on screen, and Claude Code shows the note as "Stop hook feedback".
+The prompt-and-revise behavior uses Claude Code's plugin hook modules, which are in early access. Claude Code turns them on through a rollout flag, which stays off with a third-party model provider (Bedrock, Vertex, a custom `ANTHROPIC_BASE_URL`), with nonessential traffic disabled, or on accounts the rollout hasn't reached. Set `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` to turn them on anyway. Without them the plugin falls back to a plain Stop hook: replies are still checked, and Claude Code shows the note as "Stop hook feedback", under a "Stop hook error" row.
 
 ### What gets flagged
 
@@ -147,7 +147,7 @@ The folder is created readable only by you. The key is only ever sent over https
 
 ### How it decides
 
-Each sentence of the summary is checked for unverified claims, weasel words and empty rhetoric. Each tool call is checked for paltering. A problem is flagged when Jev's yes-probability is above 0.5, on every attempt. Jev also sees the last 10 tool calls from earlier turns, so claims about earlier work aren't flagged as unverified. The full design is in [docs/jev-no-bullshit-spec.md](docs/jev-no-bullshit-spec.md).
+Each sentence of the summary is checked for unverified claims, weasel words and empty rhetoric. Each tool call is checked for paltering. A problem is flagged when Jev's yes-probability is above 0.6, on every attempt. Jev also sees the last 10 tool calls from earlier turns, so claims about earlier work aren't flagged as unverified. The full design is in [docs/jev-no-bullshit-spec.md](docs/jev-no-bullshit-spec.md).
 
 ### Requirements
 
