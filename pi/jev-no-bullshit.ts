@@ -62,7 +62,6 @@ export default function (pi: ExtensionAPI) {
     const redirects = messages
       .slice(taskIndex + 1)
       .filter((m) => (m as { role: string; customType?: string }).role === "custom" && (m as { customType?: string }).customType === CUSTOM_TYPE).length
-    if (redirects >= maxRedirects(process.env.JEV_NO_BULLSHIT_MAX_REDIRECTS)) return
 
     const last = messages[messages.length - 1] as { role: string; content?: unknown; model?: string }
     if (last?.role !== "assistant") return
@@ -110,7 +109,8 @@ export default function (pi: ExtensionAPI) {
     } catch {
       return // fail open, as the script does
     }
-    if (!reason) return
+    // The revision is still checked (and logged); past the limit it is not sent back again.
+    if (!reason || redirects >= maxRedirects(process.env.JEV_NO_BULLSHIT_MAX_REDIRECTS)) return
     return {
       entries: [{ type: "custom_message", customType: CUSTOM_TYPE, content: reason, display: true }],
       continue: true,

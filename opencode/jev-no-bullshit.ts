@@ -80,7 +80,6 @@ export const JevNoBullshit: Plugin = async ({ client }) => {
     const redirects = messages
       .slice(taskIndex + 1)
       .filter((m) => m.info.role === "user" && text(m.parts).trim().startsWith(TAG)).length
-    if (redirects >= maxRedirects(process.env.JEV_NO_BULLSHIT_MAX_REDIRECTS)) return
 
     const calls = (from: number, to: number) =>
       messages
@@ -105,7 +104,8 @@ export const JevNoBullshit: Plugin = async ({ client }) => {
     } catch {
       return // fail open, as the script does
     }
-    if (!reason) return
+    // The revision is still checked (and logged); past the limit it is not sent back again.
+    if (!reason || redirects >= maxRedirects(process.env.JEV_NO_BULLSHIT_MAX_REDIRECTS)) return
     // The person may have typed while Jev was asked; if so, they have moved on from this reply.
     const now = await client.session.messages({ path: { id: sessionID } })
     const latest = (now.data ?? []) as Message[]
