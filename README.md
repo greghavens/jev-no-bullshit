@@ -1,92 +1,159 @@
 # jev-no-bullshit
 
-A Stop hook for Claude Code and Codex. When a turn ends, it asks [Jev](https://typesafe.ai) whether the model's final summary bullshits about what it did, measured against the tool calls it actually made. If Jev flags any of four types (unverified claims, weasel words, empty rhetoric, paltering), the hook sends the model back with feedback that quotes the flagged sentence or action. It does this at most 3 times per turn.
+AI coding assistants sometimes finish with a summary that says more than they did: "All tests pass" when the tests never ran, "should work now", or an upbeat line that says nothing.
 
-The design is in [docs/jev-no-bullshit-spec.md](docs/jev-no-bullshit-spec.md).
+jev-no-bullshit checks each final summary against what the assistant actually did. If the summary bullshits, the assistant is sent back to check its work and say plainly what it did, what it verified, and what is unfinished.
+
+It works with **Claude Code** and **Codex**. The check is done by [Jev](https://typesafe.ai), a fast yes/no model from TypeSafe.
+
+## What you need
+
+- A TypeSafe API key.
+- Python 3.10 or later. Check with `python3 --version`.
 
 ## Install
 
-This repo is a plugin marketplace that both Claude Code and Codex can install from. The plugin adds one Stop hook, which runs `python3 jev-no-bullshit` from the installed copy. You need `python3` on your PATH and a TypeSafe API key (see [API key](#api-key)).
+### 1. Set your API key
 
-### Claude Code
+Add this line to your shell profile (`~/.zshrc` or `~/.bashrc`), then open a new terminal:
 
-In Claude Code:
-
-```
-/plugin marketplace add greghavens/jev-no-bullshit
-/plugin install jev-no-bullshit@jev-no-bullshit
+```sh
+export TYPESAFE_API_KEY="your-key-here"
 ```
 
-Or from a shell:
+Keep the key out of git. Don't put it in a project's settings file.
+
+### 2. Install the plugin
+
+**Claude Code**: run these in your terminal:
 
 ```sh
 claude plugin marketplace add greghavens/jev-no-bullshit
 claude plugin install jev-no-bullshit@jev-no-bullshit
 ```
 
-The hook is active from the next session. It needs Claude Code v2.1.196 or later, for `last_assistant_message`.
+Then start a new Claude Code session.
 
-### Codex
+**Codex**: run these in your terminal:
 
 ```sh
 codex plugin marketplace add greghavens/jev-no-bullshit
 codex plugin add jev-no-bullshit@jev-no-bullshit
 ```
 
-Codex does not run a plugin's hooks until you trust them. Start `codex`, run `/hooks`, and approve the `jev-no-bullshit` Stop hook. You approve it again if the hook changes in an update.
+Then start `codex`, type `/hooks`, and approve the **jev-no-bullshit** Stop hook. Codex won't run a plugin's hook until you approve it.
 
-### Uninstall
+That's it.
+
+## Using it
+
+There's nothing to run. Work as usual.
+
+Each time the assistant finishes, jev-no-bullshit checks its summary. If the summary is honest, you won't see anything.
+
+If it isn't, you'll see a line like this:
+
+```
+Asking claude-opus-5-5 to reconsider its response after bullshit detection, attempt #1
+```
+
+The assistant then gets a note that quotes exactly what was wrong, for example:
+
+```
+[jev-no-bullshit] Double-check these before you finish:
+- Unverified claim: "All tests are passing." None of your actions show this. Verify it now, or say plainly it is unverified.
+- Paltering: action 2 (Bash: npm test -> 2 failed, 41 passed) shows a failure or unfinished work that your summary leaves out or softens. Name it.
+Then rewrite your summary plainly: what you did, what you verified and how, and what failed or is unfinished.
+```
+
+It checks its work and writes a new summary, which is checked the same way. The assistant is sent back at most 3 times per answer, so it never gets stuck.
+
+### What gets flagged
+
+| Problem | Example |
+| --- | --- |
+| **Unverified claim** | "All tests pass", when no test run appears in its actions |
+| **Weasel words** | "should work", "mostly fixed", "likely resolved" |
+| **Empty rhetoric** | "The flow is now rock solid!" |
+| **Paltering** | a command failed, and the summary leaves that out or plays it down |
+
+### Is it working?
+
+Every check is logged. To see the latest one:
+
+```sh
+tail -n 1 ~/.jev-no-bullshit/log.jsonl
+```
+
+If a line says `"error": "TYPESAFE_API_KEY is not set"`, the assistant can't see your key. Set it as in step 1 and restart the assistant from a new terminal.
+
+If something goes wrong (no key, no network, Jev is slow), jev-no-bullshit steps aside and lets the assistant finish normally. It never blocks your work.
+
+### Privacy
+
+To run a check, the assistant's final summary, your request, and its tool calls and results (each cut to about 2,000 characters) are sent to the TypeSafe API.
+
+## Turn it off
+
+**Claude Code**:
 
 ```sh
 claude plugin uninstall jev-no-bullshit@jev-no-bullshit
+```
+
+**Codex**:
+
+```sh
 codex plugin remove jev-no-bullshit@jev-no-bullshit
 ```
 
-### Without the plugin system
+---
 
-Copy the script onto your PATH and add the Stop hook yourself:
+## More detail
+
+### Install without the plugin system
+
+Copy the script onto your PATH:
 
 ```sh
 install -m 0755 jev-no-bullshit ~/.local/bin/jev-no-bullshit
 ```
 
-- **Claude Code**: merge [examples/claude-settings.json](examples/claude-settings.json) into `~/.claude/settings.json` (user) or `.claude/settings.json` (project).
-- **Codex**: merge [examples/codex-hooks.json](examples/codex-hooks.json) into `~/.codex/hooks.json` or `<repo>/.codex/hooks.json`, then approve it once with `/hooks`.
+Then add the Stop hook yourself:
 
-Use only one of the two methods. With both, the hook runs twice per stop.
+- **Claude Code**: merge [examples/claude-settings.json](examples/claude-settings.json) into `~/.claude/settings.json`.
+- **Codex**: merge [examples/codex-hooks.json](examples/codex-hooks.json) into `~/.codex/hooks.json`, then approve it with `/hooks`.
 
-## API key
+Use this or the plugin, not both. With both, every check runs twice.
 
-The hook reads `TYPESAFE_API_KEY` from its environment. Keep the key out of this repo and out of project settings files. Use one of these:
+### Other ways to set the key
 
-- Export it in your shell profile (`~/.zshrc`, `~/.bashrc`): `export TYPESAFE_API_KEY=...`. Both Claude Code and Codex pass their environment through to hooks.
-- For Claude Code only, you can put it in your **user** settings instead (`~/.claude/settings.json`, which is not checked in): `{"env": {"TYPESAFE_API_KEY": "..."}}`.
-- In Claude Code on the web, add it as an environment variable in the cloud environment's settings. Also allow `api.typesafe.ai` in that environment's network access.
+- **Claude Code only**: add it to your user settings file, `~/.claude/settings.json`, as `{"env": {"TYPESAFE_API_KEY": "..."}}`.
+- **Claude Code on the web**: open the cloud environment's settings, add `TYPESAFE_API_KEY` as an environment variable, and allow `api.typesafe.ai` under network access.
 
-If the key is missing, the hook logs that and lets every turn end. It fails open.
+### Files it writes
 
-`TYPESAFE_BASE_URL` overrides the API host (default `https://api.typesafe.ai`), as in the official SDK. The tests use it to point at a local mock.
+- `~/.jev-no-bullshit/log.jsonl`: one line per check, with the time, session, attempt, every question's score, the thresholds, what was flagged, and whether it sent the assistant back.
+- `~/.jev-no-bullshit/state/<session>.json`: redirect counters for the current answer.
 
-## Wire it up
+### How it decides
 
-**Claude Code** (v2.1.196 or later): add [examples/claude-settings.json](examples/claude-settings.json) to `~/.claude/settings.json` (user) or `.claude/settings.json` (project).
+Each sentence of the summary is checked for unverified claims, weasel words and empty rhetoric. Each tool call is checked for paltering. A problem is flagged when Jev's yes-probability is above 0.5. If the same type of problem is flagged again for the same answer, the bar rises to 0.75 and then 0.875. The full design is in [docs/jev-no-bullshit-spec.md](docs/jev-no-bullshit-spec.md).
 
-**Codex**: add the same content ([examples/codex-hooks.json](examples/codex-hooks.json)) to `~/.codex/hooks.json` or `<repo>/.codex/hooks.json`, then approve it once with `/hooks`.
+### Requirements
 
-## What it writes
+Claude Code v2.1.196 or later (tested with 2.1.281), or Codex with plugin hooks (tested with 0.156.1).
 
-- `~/.jev-no-bullshit/state/<session_id>.json`: the redirect count and per-type flag counts for the current turn. They reset when `stop_hook_active` is false.
-- `~/.jev-no-bullshit/log.jsonl`: one line per check. Each line has the time, session, tool, attempt, every question's `noul`, the thresholds in force, what was flagged, whether it redirected, and the summary. Errors are logged here too.
+### Development
 
-Summaries, tool inputs and tool results (clipped to about 2,000 characters each) are sent to the TypeSafe API.
-
-## Tests
+Run the tests:
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
 
-- `tests/test_hook.py` runs the script against Claude Code and Codex transcript fixtures and a local mock of TypeSafe's `POST /v1/systemone`.
-- `tests/test_e2e.py` installs this repo as a plugin into the real `claude` and `codex` CLIs, using throwaway config directories. It then runs one headless turn per CLI against local mocks of the Anthropic Messages API, the OpenAI Responses API and TypeSafe. The scripted model runs a failing command and then claims "All tests pass." The test checks that the hook saw the real transcript, redirected once, and let the corrected answer end the turn. Each test is skipped when its CLI is not installed. Set `CLAUDE_BIN` or `CODEX_BIN` to use a specific binary. The Codex test passes `--dangerously-bypass-hook-trust` in place of the `/hooks` approval.
+- `tests/test_hook.py` tests the script against sample Claude Code and Codex transcripts, using a local stand-in for the TypeSafe API.
+- `tests/test_e2e.py` installs the plugin into the real `claude` and `codex` CLIs and runs a full turn in each against local stand-ins for the model APIs and TypeSafe. The scripted assistant runs a failing command and then claims "All tests pass." The test checks that the hook sends it back once and accepts the honest rewrite. Each test is skipped if its CLI isn't installed. Set `CLAUDE_BIN` or `CODEX_BIN` to choose a binary.
+- `tests/test_plugin.py` checks the plugin files.
 
-None of the tests use the network or real credentials. CI (`.github/workflows/test.yml`) runs everything against pinned CLI versions.
+No test uses the network or real keys. CI runs all of them on every push.

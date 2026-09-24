@@ -79,6 +79,7 @@ class _E2EBase(unittest.TestCase):
         self.assertEqual(len(log), 2, log)
         first, second = log
         self.assertNotIn("error", first, first)
+        self.assertEqual(first["missing_tool_results"], 0, "the hook ran before the tool result reached the transcript")
         self.assertEqual(first["tool"], tool)
         self.assertEqual(first["summary"], BULLSHIT_SUMMARY)
         self.assertEqual(first["flagged"], {"unverified": ["unverified_s0"]})

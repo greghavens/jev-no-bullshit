@@ -7,6 +7,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -203,6 +205,43 @@ class TranscriptTests(unittest.TestCase):
     def test_codex_legacy_json_output(self):
         text, error = hook.codex_output(json.dumps({"output": "boom", "metadata": {"exit_code": 2}}))
         self.assertEqual((text, error), ("boom", True))
+
+    def test_waits_for_lagging_tool_results(self):
+        """Claude Code writes the transcript asynchronously; a tool result can land after the Stop hook starts."""
+        path = claude_transcript(self.dir / "t.jsonl")
+        lines = path.read_text().splitlines()
+        late = next(line for line in lines if '"tool_use_id": "t2"' in line)
+        path.write_text("\n".join(line for line in lines if line != late) + "\n")
+
+        def append_later():
+            time.sleep(0.4)
+            with path.open("a") as f:
+                f.write(late + "\n")
+
+        writer = threading.Thread(target=append_later)
+        writer.start()
+        task, actions, _, pending = hook.read_transcript(str(path), hook.parse_claude)
+        writer.join()
+        self.assertEqual(pending, 0)
+        self.assertEqual(actions[1]["result"], "running...\n... 2 failed, 41 passed")
+        self.assertTrue(actions[1]["error"])
+
+    def test_wait_for_tool_results_is_bounded(self):
+        path = claude_transcript(self.dir / "t.jsonl", extra=[
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "never", "name": "Bash", "input": {"command": "sleep 999"}}]}},
+        ])
+        original = hook.TRANSCRIPT_WAIT_SECONDS
+        hook.TRANSCRIPT_WAIT_SECONDS = 0.3
+        try:
+            start = time.monotonic()
+            _, actions, _, pending = hook.read_transcript(str(path), hook.parse_claude)
+            elapsed = time.monotonic() - start
+        finally:
+            hook.TRANSCRIPT_WAIT_SECONDS = original
+        self.assertEqual(pending, 1)
+        self.assertEqual(actions[-1]["result"], hook.NO_RESULT)
+        self.assertLess(elapsed, 1.5)
 
     def test_missing_transcript(self):
         self.assertEqual(hook.parse_claude(hook.read_jsonl(str(self.dir / "nope.jsonl"))), ("", [], None))

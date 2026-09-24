@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -26,6 +27,9 @@ JEV_MODEL = "jev-latest"
 DEFAULT_BASE_URL = "https://api.typesafe.ai"
 SYSTEM_ONE_PATH = "/v1/systemone"
 JEV_TIMEOUT_SECONDS = 10.0
+# Transcripts are written asynchronously and can lag the Stop hook: wait this long for tool results.
+TRANSCRIPT_WAIT_SECONDS = 3.0
+NO_RESULT = "(no result recorded)"
 
 MAX_REDIRECTS = 3
 BASE_THRESHOLD = 0.5
@@ -260,7 +264,7 @@ def make_action(tool: str, tool_input, result: str | None, error: bool) -> dict:
     return {
         "tool": tool or "unknown",
         "input": clip(stringify(tool_input)),
-        "result": clip(result) if result is not None else "(no result recorded)",
+        "result": clip(result) if result is not None else NO_RESULT,
         "error": bool(error),
     }
 
@@ -413,6 +417,20 @@ def parse_codex(entries: list[dict]) -> tuple[str, list[dict], str | None]:
     return task, actions, model
 
 
+def read_transcript(path: str | None, parse) -> tuple[str, list[dict], str | None, int]:
+    """Parse the transcript, re-reading briefly while tool calls still lack results.
+
+    Return (task, actions, model, number of tool calls still without a result).
+    """
+    deadline = time.monotonic() + TRANSCRIPT_WAIT_SECONDS
+    while True:
+        task, actions, model = parse(read_jsonl(path))
+        pending = sum(1 for a in actions if a["result"] == NO_RESULT)
+        if not pending or time.monotonic() >= deadline:
+            return task, actions, model, pending
+        time.sleep(0.1)
+
+
 # ---------------------------------------------------------------------------
 # Jev state and questions
 
@@ -561,14 +579,20 @@ def run(hook_input: dict) -> dict | None:
         log({**base, "error": "TYPESAFE_API_KEY is not set", "summary": summary})
         return None
 
-    entries = read_jsonl(hook_input.get("transcript_path"))
-    task, actions, transcript_model = (parse_codex if is_codex else parse_claude)(entries)
+    task, actions, transcript_model, pending = read_transcript(
+        hook_input.get("transcript_path"), parse_codex if is_codex else parse_claude
+    )
     model = (hook_input.get("model") if is_codex else None) or transcript_model or "the model"
 
     state, dropped_actions = build_state(task, actions, summary)
     questions, dropped_palters = build_questions(state)
     thresholds = {t: threshold(counters["flags"][t]) for t in TYPES}
-    base.update(thresholds=thresholds, dropped_actions=dropped_actions, dropped_palter_questions=dropped_palters)
+    base.update(
+        thresholds=thresholds,
+        dropped_actions=dropped_actions,
+        dropped_palter_questions=dropped_palters,
+        missing_tool_results=pending,
+    )
     if not questions:
         log({**base, "skipped": "no sentences or actions to ask about", "summary": summary})
         return None
