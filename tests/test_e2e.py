@@ -142,6 +142,18 @@ class ClaudeCodeE2E(_E2EBase):
         self.assertIn('\\"All tests pass.\\" None of your actions show this.', json.dumps(requests[-1]["body"]))
 
 
+class ClaudeCodeModuleE2E(ClaudeCodeE2E):
+    """The same turn with hooks modules loaded: the module checks, and the plain Stop hook stands down.
+
+    ClaudeCodeE2E runs without them (a mock provider leaves the rollout flag off), so it covers the
+    plain Stop hook that stands in where modules do not load.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.env["CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"] = "1"
+
+
 @unittest.skipUnless(CODEX_BIN, "codex CLI not found (set CODEX_BIN)")
 class CodexE2E(_E2EBase):
     def setUp(self):

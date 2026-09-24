@@ -51,11 +51,14 @@ There's nothing to run. Work as usual.
 
 Each time the assistant finishes, jev-no-bullshit checks its summary. If the summary is honest, you won't see anything.
 
-If it isn't, you'll see a line like this:
+If it isn't, what you see depends on the tool:
 
-```
-Asking claude-opus-5-5 to reconsider its response after bullshit detection, attempt #1
-```
+- **Claude Code**: the flagged reply is replaced by one dim line, "Reply withdrawn after the Jev check; the revised reply follows." The plugin then sends the assistant a short prompt, "Jev flagged the last reply. Revise it using the attached notes.", and the note itself goes along as context you don't see. Claude Code labels that prompt as coming from the plugin.
+- **Codex**, and Claude Code where plugin hook modules aren't enabled (see below): the assistant is stopped from finishing, and you'll see a line like this:
+
+  ```
+  Asking claude-opus-5-5 to reconsider its response after bullshit detection, attempt #1
+  ```
 
 The assistant then gets a note that quotes exactly what was wrong, for example:
 
@@ -67,6 +70,10 @@ Then rewrite your summary plainly: what you did, what you verified and how, and 
 ```
 
 It checks its work and writes a new summary, which is checked the same way. The assistant is sent back at most 3 times per answer, so it never gets stuck.
+
+### Hook modules in Claude Code
+
+The withdraw-and-revise behavior uses Claude Code's plugin hook modules, which are in early access. Claude Code turns them on through a rollout flag, which stays off with a third-party model provider (Bedrock, Vertex, a custom `ANTHROPIC_BASE_URL`), with nonessential traffic disabled, or on accounts the rollout hasn't reached. Set `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` to turn them on anyway. Without them the plugin falls back to a plain Stop hook: replies are still checked, the flagged reply stays on screen, and Claude Code shows the note as "Stop hook feedback".
 
 ### What gets flagged
 
@@ -140,7 +147,7 @@ The folder is created readable only by you. The key is only ever sent over https
 
 ### How it decides
 
-Each sentence of the summary is checked for unverified claims, weasel words and empty rhetoric. Each tool call is checked for paltering. A problem is flagged when Jev's yes-probability is above 0.5. If the same type of problem is flagged again for the same answer, the bar rises to 0.75 and then 0.875. The full design is in [docs/jev-no-bullshit-spec.md](docs/jev-no-bullshit-spec.md).
+Each sentence of the summary is checked for unverified claims, weasel words and empty rhetoric. Each tool call is checked for paltering. A problem is flagged when Jev's yes-probability is above 0.73, on every attempt. Jev also sees the last 10 tool calls from earlier turns, so claims about earlier work aren't flagged as unverified. The full design is in [docs/jev-no-bullshit-spec.md](docs/jev-no-bullshit-spec.md).
 
 ### Requirements
 
@@ -155,7 +162,8 @@ python3 -m unittest discover -s tests -v
 ```
 
 - `tests/test_hook.py` tests the script against sample Claude Code and Codex transcripts, using a local stand-in for the TypeSafe API.
-- `tests/test_e2e.py` installs the plugin into the real `claude` and `codex` CLIs and runs a full turn in each against local stand-ins for the model APIs and TypeSafe. The scripted assistant runs a failing command and then claims "All tests pass." The test checks that the hook sends it back once and accepts the honest rewrite. Each test is skipped if its CLI isn't installed. Set `CLAUDE_BIN` or `CODEX_BIN` to choose a binary.
+- `hooks/jev.test.tsx` tests the Claude Code hook module. Run it with `claude plugin test`.
+- `tests/test_e2e.py` installs the plugin into the real `claude` and `codex` CLIs and runs a full turn in each (in Claude Code, once with hook modules and once without) against local stand-ins for the model APIs and TypeSafe. The scripted assistant runs a failing command and then claims "All tests pass." The test checks that the hook sends it back once and accepts the honest rewrite. Each test is skipped if its CLI isn't installed. Set `CLAUDE_BIN` or `CODEX_BIN` to choose a binary.
 - `tests/test_plugin.py` checks the plugin files.
 - `tests/test_live.py` calls the real TypeSafe API. It runs only when `TYPESAFE_API_KEY` is set, and it prints Jev's scores for every check. It runs the hook on the spec's example, where a failed `npm test` is summarized as "All tests are passing": that must be redirected, and an honest summary of the same actions must not. It also repeats the end-to-end test in each CLI with real Jev.
 

@@ -1,7 +1,7 @@
 {
   "name": "jev-no-bullshit",
   "version": "0.2.0",
-  "description": "Asks Jev whether the model's final summary bullshits about what it did, and sends the model back to restate it plainly.",
+  "description": "Stop hook that asks Jev whether the model's final summary bullshits about what it did, and sends the model back to restate it plainly.",
   "author": {
     "name": "Greg Havens"
   },
@@ -13,7 +13,5 @@
     "honesty",
     "jev",
     "typesafe"
-  ],
-  "types": "./types/index.d.ts",
-  "hooks": "./hooks/claude-code.json"
+  ]
 }

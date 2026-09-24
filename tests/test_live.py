@@ -38,6 +38,7 @@ def live_env(home: Path) -> dict:
     """The real environment (key, proxy, CA bundle) with a throwaway HOME and no TypeSafe URL override."""
     env = {k: v for k, v in os.environ.items() if k != "TYPESAFE_BASE_URL"}
     env["HOME"] = str(home)
+    env["JEV_NO_BULLSHIT_MODULE"] = "1"  # the script runs as Claude Code's hooks module runs it
     return env
 
 
