@@ -50,7 +50,8 @@ class LiveJev(unittest.TestCase):
         for _ in range(3):
             values = hook.noul_values(hook.ask_jev(state, questions, self.key, time.monotonic() + 60))
             counts.update(hook.find_flags(values, thresholds).get(qtype, []))
-        return [state["sentences"][int(q.rsplit("_s", 1)[1])] for q, n in counts.items() if n >= 2]
+        written = [s for _, s in hook.sentences_with_headings(summary)]
+        return [written[int(q.rsplit("_s", 1)[1])] for q, n in counts.items() if n >= 2]
 
 class UnverifiedClaimTests(LiveJev):
     def test_list_under_a_lead_in(self):

@@ -96,6 +96,13 @@ export default function (pi: ExtensionAPI) {
         task: taskIndex >= 0 ? text((messages[taskIndex] as { content?: unknown }).content) : "",
         actions: calls.filter((c) => c.now).map(strip),
         earlier_actions: calls.filter((c) => !c.now).map(strip),
+        // What was said before the reply: a reply that refers to an earlier message rests on it.
+        conversation: messages
+          .slice(0, -1)
+          .map((m) => m as { role: string; content?: unknown })
+          .filter((m) => m.role === "user" || m.role === "assistant" || m.role === "custom")
+          .map((m) => ({ role: m.role === "custom" ? "hook" : m.role, text: text(m.content) }))
+          .filter((m) => m.text.trim()),
         model: last.model,
         last_assistant_message: reply,
         stop_hook_active: redirects > 0,

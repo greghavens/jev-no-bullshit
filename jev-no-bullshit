@@ -12,8 +12,9 @@ exits 0 and fails open: any error lets the turn end.
 Claude Code and Codex send a Stop event naming their transcript. The pi and
 opencode plugins (pi/, opencode/) have no transcript file to name, so they send
 the turn itself: {"host", "session_id", "task", "actions", "earlier_actions",
-"model", "last_assistant_message", "stop_hook_active"}, each action being
-{"tool", "input", "result", "error"}.
+"conversation", "model", "last_assistant_message", "stop_hook_active"}, each
+action being {"tool", "input", "result", "error"} and each conversation message
+{"role", "text"}, oldest first, ending before the reply.
 """
 
 from __future__ import annotations
@@ -60,11 +61,14 @@ OLDER_ACTIONS_TOKENS = 6_000
 OLDER_INPUT_CHARS = 120
 OLDER_RESULT_CHARS = 300
 
-# The messages before the task message, newest last: what the person and the assistant said. A reply
-# that agrees to an instruction or refers to an earlier reply ("items 3 and 4 are dropped") rests on
-# them, not on any action, and was flagged as unverified without them.
+# The session's messages before the reply, newest last: what the person, the assistant and hooks said.
+# A reply that agrees to an instruction or refers to an earlier reply ("items 3 and 4 are dropped", "I
+# said this last time", "I rewrote them five times") rests on them, not on any action, and was flagged
+# as unverified without them. The newest go in whole (clipped), older ones as one line each.
 CONVERSATION_MESSAGES = 2
 CONVERSATION_CLIP_CHARS = 2_000
+OLDER_MESSAGES_TOKENS = 8_000
+OLDER_MESSAGE_CHARS = 1_200
 
 RESULT_CLIP_CHARS = 2_000
 # A clipped result also keeps up to this many characters of middle lines holding the summary's numbers
@@ -72,6 +76,11 @@ RESULT_CLIP_CHARS = 2_000
 # summary quoting those rows was flagged as unverified three times.
 RESULT_EVIDENCE_CHARS = 1_000
 EVIDENCE_LINE_CHARS = 300
+# The other omitted middle lines go in as their starts, up to this many characters in all, so a
+# reply about every line of a file (its count, its ids, its order) can be checked against each line.
+# Head and tail alone sent 5 of 25 lines read back, and "all 25 ids match, in order" was flagged.
+RESULT_OUTLINE_CHARS = 3_000
+OUTLINE_LINE_CHARS = (40, 120)  # the narrowest start worth sending, and the widest
 # Long inputs, like scripts, bury the evidence in results. On replays of 72 real checks, clipping
 # inputs to 300 cut false unverified flags on sessions full of look-alike scripts (0.77 to 0.20)
 # and changed nothing clear elsewhere. Clipping results too hid real evidence, so they stay long.
@@ -127,7 +136,8 @@ QUESTIONS = {
             "false": (
                 "`conversation` or an action's input or result shows what `sentences[{i}]` claims, or the sentence makes no "
                 "claim about the assistant's own work (a question, a plan, an option, an explanation, a "
-                "statement about the user, or an admission that something is unverified or unknown)."
+                "statement about the user, a statement about this reply's own content, or an admission that something is "
+                "unverified or unknown)."
             ),
         },
     },
@@ -305,6 +315,10 @@ def clip(text: str, limit: int = RESULT_CLIP_CHARS) -> str:
 _NUMBER_RE = re.compile(r"\d+(?:[,_]\d{3})*(?:\.\d+)?")
 _CODE_TERM_RE = re.compile(r"`([^`\n]{3,80})`|\b([A-Za-z][\w.\-/]*[_./][\w.\-/]*\w)")
 _DIGIT_GROUP_RE = re.compile(r"(?<=\d)[,_](?=\d{3})")
+# Text the summary quotes: a reply citing what a file says ("input has "Use of a fully-qualified…"") is
+# backed by the line that holds it, which a clipped result dropped.
+_QUOTE_TERM_RE = re.compile(r'"([^"\n]*)"|“([^”\n]*)”')
+_ELLIPSIS_RE = re.compile(r"\.\.\.|…")
 
 
 def evidence_terms(summary: str) -> tuple[set[str], set[str]]:
@@ -313,7 +327,11 @@ def evidence_terms(summary: str) -> tuple[set[str], set[str]]:
     Numbers lose digit-group separators, so 18,695 matches 18695; one-digit numbers match too much.
     """
     numbers = {n for n in (_DIGIT_GROUP_RE.sub("", m) for m in _NUMBER_RE.findall(summary)) if len(n.replace(".", "")) >= 2}
-    terms = {(a or b) for a, b in _CODE_TERM_RE.findall(summary)}
+    terms = {(a or b).strip('"\'') for a, b in _CODE_TERM_RE.findall(summary)}
+    # Quotes are paired outside code spans, whose own quote marks would pair with the wrong ones.
+    for a, b in _QUOTE_TERM_RE.findall(re.sub(r"`[^`\n]*`", " ", summary)):
+        # A quote cut short with an ellipsis is matched by its pieces.
+        terms.update(piece.strip() for piece in _ELLIPSIS_RE.split(a or b) if 8 <= len(piece.strip()) <= 200)
     return numbers, {t for t in terms if len(t) >= 4}
 
 
@@ -326,24 +344,47 @@ def action_stems(summary: str) -> set[str]:
 _INPUT_PIECE_RE = re.compile(r"\n|\\n|;|&&|\|\|")
 
 
-def evidence_window(piece: str, evidence: tuple[set[str], set[str]], stems: set[str]) -> str:
-    """INPUT_EVIDENCE_PIECE_CHARS of a long piece, starting a little before its first match."""
+def evidence_window(
+    piece: str, evidence: tuple[set[str], set[str]], stems: set[str], width: int = INPUT_EVIDENCE_PIECE_CHARS, longest: bool = False
+) -> str:
+    """`width` characters of a long piece, starting a little before its first match, or with `longest`
+    its longest one: a result line's number ("17" of "17\t{...}") matched before the phrase quoted from it."""
     numbers, terms = evidence
     low = piece.lower()
-    found = [low.find(stem) for stem in stems] + [piece.find(t) for t in terms]
-    found += [m.start() for m in _NUMBER_RE.finditer(piece) if _DIGIT_GROUP_RE.sub("", m.group()) in numbers]
-    first = min((f for f in found if f >= 0), default=0)
-    start = max(0, min(first - INPUT_EVIDENCE_PIECE_CHARS // 3, len(piece) - INPUT_EVIDENCE_PIECE_CHARS + 2))
-    end = start + INPUT_EVIDENCE_PIECE_CHARS - 2
+    found = [(len(stem), low.find(stem)) for stem in stems] + [(len(t), piece.find(t)) for t in terms]
+    found += [(len(m.group()), m.start()) for m in _NUMBER_RE.finditer(piece) if _DIGIT_GROUP_RE.sub("", m.group()) in numbers]
+    found = [(size, at) for size, at in found if at >= 0]
+    if longest:
+        first = min(found, key=lambda f: (-f[0], f[1]), default=(0, 0))[1]
+    else:
+        first = min((at for _, at in found), default=0)
+    start = max(0, min(first - width // 3, len(piece) - width + 2))
+    end = start + width - 2
     return ("…" if start else "") + piece[start:end] + ("…" if end < len(piece) else "")
 
 
 def clip_input(
     text: str, evidence: tuple[set[str], set[str]] = (set(), set()), stems: set[str] = frozenset(), limit: int = INPUT_CLIP_CHARS
 ) -> str:
-    """Keep the head and tail of a long input, plus the middle pieces that hold the summary's evidence."""
-    if len(text) <= limit:
+    """Keep the head and tail of a long input, plus the middle pieces that hold the summary's evidence.
+
+    A JSON object is clipped field by field, the long fields sharing what the short ones leave, so a
+    long `pattern` does not cut the `path` after it.
+    """
+    fields = json_object(text)
+    escaped = fields and any(isinstance(v, str) and json.dumps(v, ensure_ascii=False)[1:-1] != v for v in fields.values())
+    if len(text) <= limit and not escaped:
         return text
+    if fields:
+        # Strings go as written: JSON's escapes made a `\\"` in a search pattern read as `\\\\\"`, so
+        # a reply quoting the pattern it used looked wrong.
+        written = {k: v if isinstance(v, str) else json.dumps(v, ensure_ascii=False) for k, v in fields.items()}
+        short = sum(len(k) + len(v) + 3 for k, v in written.items() if len(v) <= limit // 4)
+        long_keys = [k for k, v in written.items() if len(v) > limit // 4]
+        share = max((limit - short) // max(len(long_keys), 1), 60)
+        if sum(len(k) + len(v) + 3 for k, v in written.items()) > limit:
+            written = {k: clip_input(v, evidence, stems, share) if k in long_keys else v for k, v in written.items()}
+        return "\n".join(f"{k}:\n{v}" if "\n" in v else f"{k}: {v}" for k, v in written.items())
     half = limit // 2
     middle_start, middle_end = half, len(text) - half
     picked = []  # (hits, start, end)
@@ -368,10 +409,27 @@ def clip_input(
         keep.append((start, end, piece))
     parts, last = [text[:middle_start]], middle_start
     for start, end, piece in sorted(keep):
-        parts.append(f"\n…[{start - last} chars omitted]…\n{piece}")
+        line_start = text.rfind("\n", 0, start) + 1
+        # A piece from inside a line, or one windowed past its own start, whose line's start was not sent:
+        # the line, by its start, as a result's evidence lines go.
+        if last <= line_start and (line_start < start or piece.startswith("…")):
+            if line_start > last:
+                parts.append(outline(text[last:line_start], text[last - 1] == "\n"))
+            parts.append(text[line_start : line_start + OUTLINE_LINE_CHARS[1]])
+            parts.append(piece if piece.startswith("…") else "…" + piece)
+        else:
+            parts.append(outline(text[last:start], text[last - 1] == "\n") + piece)
         last = end
-    parts.append(f"\n…[{middle_end - last} chars omitted]…\n{text[middle_end:]}")
+    parts.append(outline(text[last:middle_end], text[last - 1] == "\n") + text[middle_end:])
     return "".join(parts)
+
+
+def json_object(text: str) -> dict | None:
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def clip_result(text: str, evidence: tuple[set[str], set[str]] = (set(), set()), limit: int = RESULT_CLIP_CHARS) -> str:
@@ -398,17 +456,35 @@ def clip_result(text: str, evidence: tuple[set[str], set[str]] = (set(), set()),
     for hits, start, end in sorted(picked, key=lambda p: (-p[0], p[1])):  # most matches first, then earliest
         line = text[start:end].rstrip("\n")
         if len(line) > EVIDENCE_LINE_CHARS:
-            line = line[: EVIDENCE_LINE_CHARS - 1] + "…"
+            line = evidence_window(line, evidence, set(), EVIDENCE_LINE_CHARS, longest=True)
         if len(line) > room:
             continue
         room -= len(line)
         keep.append((start, end, line))
     parts, last = [text[:middle_start]], middle_start
     for start, end, line in sorted(keep):
-        parts.append(f"\n…[{start - last} chars omitted]…\n{line}")
+        if line.startswith("…") and (start == 0 or text[start - 1] == "\n"):
+            line = text[start : start + OUTLINE_LINE_CHARS[1]] + line  # the window's line, by its start
+        parts.append(outline(text[last:start], text[last - 1] == "\n") + line)
         last = end
-    parts.append(f"\n…[{middle_end - last} chars omitted]…\n{text[middle_end:]}")
+    parts.append(outline(text[last:middle_end], text[last - 1] == "\n") + text[middle_end:])
     return "".join(parts)
+
+
+def outline(gap: str, at_line_start: bool) -> str:
+    """An omitted stretch of a result or input: each line that starts in it as its start, when that fits, or its size."""
+    if not gap:
+        return "\n"
+    lines = gap.split("\n")
+    # The first piece ends a kept line unless the gap starts a line; the last starts the line the next
+    # kept text continues.
+    whole = [l for l in lines[0 if at_line_start else 1 :] if l.strip()]
+    narrow, wide = OUTLINE_LINE_CHARS
+    width = min(wide, RESULT_OUTLINE_CHARS // len(whole)) if whole else 0
+    if width < narrow:
+        return f"\n…[{len(gap)} chars omitted]…\n"
+    starts = [l if len(l) <= width else l[: width - 1] + f"…[{len(l) - width + 1} chars]" for l in whole]
+    return "\n…[line starts:]\n" + "\n".join(starts) + "\n…\n"
 
 
 def evidence_hits(text: str, evidence: tuple[set[str], set[str]]) -> int:
@@ -449,6 +525,22 @@ def older_lines(older: list[dict], room: float = OLDER_ACTIONS_TOKENS) -> list[d
     return kept[::-1]
 
 
+def conversation_lines(messages: list[dict]) -> list[dict]:
+    """The newest CONVERSATION_MESSAGES messages clipped, and before them as many older ones as fit
+    OLDER_MESSAGES_TOKENS as one line each."""
+    split = max(len(messages) - CONVERSATION_MESSAGES, 0)
+    recent = [{"role": m["role"], "text": clip(m["text"], CONVERSATION_CLIP_CHARS)} for m in messages[split:]]
+    older, room = [], OLDER_MESSAGES_TOKENS
+    for m in reversed(messages[:split]):
+        line = {"role": m["role"], "text": one_line(m["text"], OLDER_MESSAGE_CHARS)}
+        cost = ITEM_OVERHEAD_TOKENS + estimate_tokens(line)
+        if cost > room:
+            break
+        room -= cost
+        older.append(line)
+    return older[::-1] + recent
+
+
 def one_line(text: str, limit: int) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -479,6 +571,64 @@ def split_sentences(summary: str) -> list[str]:
     if code is not None:
         entries.append("\n".join(code))
     return entries
+
+
+# A line that only names what follows it: a Markdown heading or a line that is just a bold label.
+# A plain line ending in ":" is a sentence of its own, often a claim, so it names nothing.
+_HEADING_RE = re.compile(r"^(?:#{1,6}\s+(?P<md>.+?)\s*#*|\*\*(?P<bold>[^*]+?)\*\*:?)\s*$")
+
+
+def heading_of(line: str) -> tuple[str, bool] | None:
+    """The heading a line names, and whether it is a Markdown heading (which lasts to the next one)."""
+    match = _HEADING_RE.match(line.strip())
+    if not match:
+        return None
+    name = (match.group("md") or match.group("bold")).strip().rstrip(":").strip()
+    return (name, bool(match.group("md"))) if name else None
+
+
+def sentences_with_headings(summary: str) -> list[tuple[str | None, str]]:
+    """Each entry of split_sentences with the heading it sits under, if any."""
+    entries: list[tuple[str | None, str]] = []
+    section = None  # the last Markdown heading
+    label = None  # a label line, which covers the block under it
+    started = False  # whether that block has begun
+    code: list[str] | None = None
+    fence = ""
+    for line in summary.splitlines():
+        if code is not None:
+            code.append(line)
+            if line.strip().startswith(fence):
+                entries.append((None, "\n".join(code)))
+                code = None
+            continue
+        match = _FENCE_RE.match(line)
+        if match:
+            fence, code, label = match.group(1), [line], None
+            continue
+        if not line.strip():
+            if started:
+                label = None
+            continue
+        found = heading_of(line)
+        if found:
+            entries.extend((None, p) for p in _split_line(line))
+            name, is_section = found
+            if is_section:
+                section, label = name, None
+            else:
+                label, started = name, False
+            continue
+        started = True
+        entries.extend((label or section, p) for p in _split_line(line))
+    if code is not None:
+        entries.append((None, "\n".join(code)))
+    return entries
+
+
+def sentence_entries(summary: str) -> list[str]:
+    """The sentences as Jev reads them: one under a heading carries it, as a reader of the summary sees it."""
+    return [f"{h}: {s}" if h else s for h, s in sentences_with_headings(summary)]
 
 
 def _split_line(line: str) -> list[str]:
@@ -583,11 +733,41 @@ def content_text(content) -> str:
     return stringify(content)
 
 
+# ripgrep's stand-in for a matching line too long to print. Jev read "12:[Omitted long matching line]"
+# as no match, and flagged a reply saying the search found the string on line 12.
+_RG_LONG_LINE_RE = re.compile(r"^((?:[^\n:]+:)?)(\d+):\[Omitted long matching line\]$", re.M)
+
+
+# pytest's progress line: one character per test. Jev read "...." as nothing, and flagged "4 of 13
+# tests have passed so far" read from it.
+_PYTEST_PROGRESS_RE = re.compile(r"^(?:\S+\.py )?([.FEsxX]+)(?: +\[ *\d+%\])?$", re.M)
+_PYTEST_MARKS = {".": "passed", "F": "failed", "E": "errors", "s": "skipped", "x": "xfailed", "X": "xpassed"}
+
+
+def plain_result(result: str, input_text_: str = "") -> str:
+    """A result with tool shorthand written out."""
+    result = _RG_LONG_LINE_RE.sub(r"\1\2:[line \2 matches; it is too long to print]", result)
+    if "pytest" in input_text_ or "pytest" in result:
+        result = with_pytest_counts(result)
+    return result
+
+
+def with_pytest_counts(result: str) -> str:
+    """A pytest result with its progress marks counted after it."""
+    if result:
+        marks = "".join(m.group(1) for m in _PYTEST_PROGRESS_RE.finditer(result))
+        if marks:
+            counts = ", ".join(f"{marks.count(c)} {name}" for c, name in _PYTEST_MARKS.items() if marks.count(c))
+            result += f"\n[pytest progress marks above, one per test: {counts}]"
+    return result
+
+
 def make_action(tool: str, tool_input, result: str | None, error: bool) -> dict:
+    text = input_text(tool_input)
     return {
         "tool": tool or "unknown",
-        "input": input_text(tool_input),  # clipped in build_state, against the summary
-        "result": result if result is not None else NO_RESULT,  # clipped in build_state, against the summary
+        "input": text,  # clipped in build_state, against the summary
+        "result": plain_result(result, text) if result is not None else NO_RESULT,  # clipped in build_state, against the summary
         "error": bool(error),
     }
 
@@ -772,15 +952,79 @@ def parse_codex(entries: list[dict]) -> tuple[str, list[dict], str | None, list[
     return task, actions, model, earlier
 
 
+def hook_text(text: str) -> str | None:
+    """The feedback in a message a hook or plugin sent in the user's place, or None for any other text."""
+    stripped = text.strip()
+    if stripped.startswith("Stop hook feedback:"):
+        return stripped[len("Stop hook feedback:") :].strip()  # its attachment copy names the hook
+    if stripped.startswith("The jev-no-bullshit plugin sent a message:"):
+        return stripped
+    if stripped.startswith("<hook_prompt"):
+        return re.sub(r"</?hook_prompt[^>]*>", "", stripped).strip()
+    if MARKER in stripped[:300]:
+        return stripped
+    return None
+
+
+_QUOTED_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
+def plugin_note(text: str) -> str:
+    """This plugin's earlier note cut to what it asked about. Its verdicts ("None of your actions show
+    this") were taken as evidence against the revision, raising true claims backed by tool output to
+    0.84; without the note, a reply saying it fixed "the flagged sentence" had nothing to refer to."""
+    items = []
+    for line in text.splitlines():
+        if not line.startswith("- "):
+            continue
+        kind = line[2:].split(":", 1)[0]
+        quoted = _QUOTED_RE.search(line)
+        items.append(f"{kind}: {quoted.group()}" if quoted else kind)
+    return f"{MARKER} asked the assistant to double-check: " + "; ".join(items) if items else MARKER
+
+
+def without_reply(messages: list[dict]) -> list[dict]:
+    """The messages up to, not including, the reply being checked (the last assistant message)."""
+    last = max((i for i, m in enumerate(messages) if m["role"] == "assistant"), default=len(messages))
+    return messages[:last]
+
+
 def conversation_claude(entries: list[dict]) -> list[dict]:
-    """Return the last CONVERSATION_MESSAGES messages before the task message in a Claude Code transcript.
+    """Return the session's messages before the reply being checked, oldest first: what the person
+    typed, what the assistant said (its replies within this turn too), and what hooks and plugins sent
+    in the user's place ("hook").
 
     Each is {"role", "text"}. A trimmed copy of the conversation appended to the file repeats them, so
-    each is counted once, by timestamp and text.
+    each is counted once, by timestamp and text; a hook's note recorded twice in a row (as a message and
+    an attachment) is counted once.
     """
     messages: dict[tuple[str, str], dict] = {}
+
+    def add(stamp: str, role: str, text: str, source: str = "") -> None:
+        # A hook's note is kept by its text alone, so the two records of one note compare equal; the
+        # attachment's copy names the hook's command, which the message copy lacks.
+        messages.setdefault((stamp, text), {"role": role, "text": text, "source": source})
+
     for e in entries:
-        if e.get("isSidechain") or e.get("isMeta") or e.get("isCompactSummary") or e.get("type") not in ("user", "assistant"):
+        stamp = str(e.get("timestamp") or "")
+        if e.get("isSidechain") or e.get("isCompactSummary"):
+            continue
+        if e.get("type") == "attachment":
+            a = e.get("attachment") or {}
+            source = ""
+            if a.get("type") == "hook_additional_context":
+                text = content_text(a.get("content"))
+            elif a.get("type") == "hook_blocking_error":
+                blocking = a.get("blockingError") or {}
+                text = stringify(blocking.get("blockingError"))
+                if blocking.get("command"):
+                    source = f'{a.get("hookEvent") or a.get("hookName") or "A"} hook `{blocking["command"]}`'
+            else:
+                continue
+            if text.strip():
+                add(stamp, "hook", text.strip(), source)
+            continue
+        if e.get("type") not in ("user", "assistant"):
             continue
         content = (e.get("message") or {}).get("content")
         if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
@@ -788,24 +1032,44 @@ def conversation_claude(entries: list[dict]) -> list[dict]:
         if e["type"] == "assistant" and isinstance(content, list):
             content = [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
         text = content_text(content).strip()
-        if not text or (e["type"] == "user" and not is_real_user_text(text)):
+        if not text:
             continue
-        messages.setdefault((str(e.get("timestamp") or ""), text), {"role": e["type"], "text": text})
-    ordered = [m for _, m in sorted(messages.items(), key=lambda kv: kv[0][0])]
-    last_user = max((i for i, m in enumerate(ordered) if m["role"] == "user"), default=-1)
-    return ordered[max(last_user - CONVERSATION_MESSAGES, 0) : max(last_user, 0)]
+        if e["type"] == "user":
+            note = hook_text(text)
+            if note is not None:
+                add(stamp, "hook", note)
+                continue
+            if e.get("isMeta") or not is_real_user_text(text):
+                continue
+        add(stamp, e["type"], text)
+    ordered: list[dict] = []
+    for _, m in sorted(messages.items(), key=lambda kv: kv[0][0]):
+        if m["role"] == "hook" and MARKER in m["text"][:300]:
+            m = {**m, "text": plugin_note(m["text"])}
+        if m["role"] == "hook" and ordered and ordered[-1]["role"] == "hook" and ordered[-1]["text"] == m["text"]:
+            ordered[-1]["source"] = ordered[-1]["source"] or m["source"]
+            continue
+        ordered.append(m)
+    return without_reply(
+        [{"role": m["role"], "text": f'{m["source"]}: {m["text"]}' if m.get("source") else m["text"]} for m in ordered]
+    )
 
 
 def conversation_codex(entries: list[dict]) -> list[dict]:
-    """Return the last CONVERSATION_MESSAGES messages before the task message in a Codex rollout file."""
+    """Return the session's messages before the reply being checked from a Codex rollout file, as
+    conversation_claude does."""
     ordered = []
     for kind, p in _codex_items(entries):
         if kind == "response_item" and p.get("type") == "message" and p.get("role") in ("user", "assistant"):
             text = content_text(p.get("content")).strip()
-            if text and (p["role"] == "assistant" or is_real_user_text(text)):
+            if not text:
+                continue
+            note = hook_text(text) if p["role"] == "user" else None
+            if note is not None:
+                ordered.append({"role": "hook", "text": note})
+            elif p["role"] == "assistant" or is_real_user_text(text):
                 ordered.append({"role": p["role"], "text": text})
-    last_user = max((i for i, m in enumerate(ordered) if m["role"] == "user"), default=-1)
-    return ordered[max(last_user - CONVERSATION_MESSAGES, 0) : max(last_user, 0)]
+    return without_reply(ordered)
 
 
 def read_transcript(path: str | None, parse) -> tuple[str, list[dict], str | None, int, list[dict]]:
@@ -915,6 +1179,13 @@ def build_state(
     """
     evidence = evidence_terms(summary)
     stems = action_stems(summary)
+    # A result that is only progress marks, read from a file an earlier pytest run wrote ("tail
+    # out.txt" printing "...."), names no pytest itself.
+    if any("pytest" in a["input"] for a in [*earlier, *actions]):
+        actions = [
+            {**a, "result": with_pytest_counts(a["result"])} if _PYTEST_PROGRESS_RE.fullmatch(a["result"].strip()) else a
+            for a in actions
+        ]
 
     def clipped(a: dict) -> dict:
         return {**a, "input": clip_input(a["input"], evidence, stems), "result": clip_result(a["result"], evidence)}
@@ -923,13 +1194,11 @@ def build_state(
     raw_earlier = list(earlier)
     state = {
         "task": clip(task, 8_000),
-        "conversation": [
-            {"role": m["role"], "text": clip(m["text"], CONVERSATION_CLIP_CHARS)} for m in conversation[-CONVERSATION_MESSAGES:]
-        ],
+        "conversation": conversation_lines(list(conversation)),
         "actions": [],
         "earlier_actions": [],
         "summary": summary,
-        "sentences": split_sentences(summary),
+        "sentences": sentence_entries(summary),
     }
     room = budget - estimate_tokens(state)
     if room < 0:
@@ -1200,12 +1469,13 @@ def given_turn(hook_input: dict) -> tuple[str, list[dict], str | None, int, list
 
 
 def given_conversation(hook_input: dict) -> list[dict]:
-    """The messages before the task message as a plugin sent them, if it did."""
+    """The messages before the reply as a plugin sent them, if it did."""
     messages = hook_input.get("conversation")
-    return [
+    given = [
         {"role": str(m.get("role") or ""), "text": str(m.get("text") or "")}
         for m in messages if isinstance(m, dict) and str(m.get("text") or "").strip()
     ] if isinstance(messages, list) else []
+    return [{"role": "hook", "text": plugin_note(m["text"])} if MARKER in m["text"][:300] else m for m in given]
 
 
 def run(hook_input: dict) -> dict | None:

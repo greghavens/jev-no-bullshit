@@ -322,8 +322,25 @@ class SizeTests(unittest.TestCase):
         self.assertNotIn("noise line", clipped)
 
     def test_results_without_cited_lines_clip_as_before(self):
-        result = "A" * 3000 + "\n" + "Z" * 3000
+        result = "A" * 6000
         self.assertEqual(hook.clip_result(result, hook.evidence_terms("Ran 12 tests in `test_hook.py`.")), hook.clip(result))
+
+    def test_a_line_the_clip_cuts_into_keeps_its_start(self):
+        # The line the tail begins inside would otherwise be shown without the start that names it.
+        result = "A" * 3000 + "\n" + "id-7 " + "Z" * 3000
+        clipped = hook.clip_result(result)
+        self.assertTrue(clipped.startswith("A" * 1000) and clipped.endswith("Z" * 1000))
+        self.assertIn("\n…[line starts:]\nid-7 ZZZ", clipped)
+
+    def test_a_long_input_keeps_every_line_by_its_start(self):
+        # A reply saying it wrote all 25 records was flagged: the written file's middle lines went
+        # as their cited claims only, without the ids that start them.
+        lines = [f'{{"id": "rec-{i:02}", "claims": [' + '{"text": "x", "span": "status code 504"}, ' * 30 + "]}" for i in range(25)]
+        written = {"file_path": "out.jsonl", "content": "\n".join(lines)}
+        summary = 'I wrote all 25 records to `out.jsonl`, each "status code 504" claim with its span.'
+        clipped = hook.clip_input(hook.input_text(written), hook.evidence_terms(summary), hook.action_stems(summary))
+        for i in range(25):
+            self.assertIn(f'{{"id": "rec-{i:02}"', clipped)
 
     def test_cited_middle_lines_are_capped(self):
         result = "h" * 1000 + "\n" + "count 4242 " * 40 + "\n" + "row 4242\n" * 500 + "t" * 1000

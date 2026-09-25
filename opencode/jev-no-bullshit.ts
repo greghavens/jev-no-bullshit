@@ -93,6 +93,11 @@ export const JevNoBullshit: Plugin = async ({ client }) => {
       task: taskIndex >= 0 ? text(messages[taskIndex].parts) : "",
       actions: calls(taskIndex + 1, messages.length),
       earlier_actions: calls(0, Math.max(taskIndex, 0)),
+      // What was said before the reply: a reply that refers to an earlier message rests on it.
+      conversation: messages
+        .slice(0, -1)
+        .map((m) => ({ role: m.info.role, text: text(m.parts) }))
+        .filter((m) => m.text.trim()),
       model: last.info.modelID,
       last_assistant_message: reply,
       stop_hook_active: redirects > 0,
