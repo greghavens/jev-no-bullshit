@@ -1,6 +1,6 @@
 {
   "name": "jev-no-bullshit",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Stop hook that asks Jev whether the model's final summary bullshits about what it did, and sends the model back to restate it plainly.",
   "author": {
     "name": "Greg Havens"
