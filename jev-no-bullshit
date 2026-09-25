@@ -1148,6 +1148,65 @@ def state_token_budget(scale: float = 1.0) -> float:
     return STATE_AND_QUESTION_TOKEN_LIMIT * scale / ESTIMATE_MARGIN - REQUEST_OVERHEAD_TOKENS - longest
 
 
+# Every action's JSON is rewritten without the spaces it was printed with, before anything is clipped. A
+# list of objects keeps one entry per line, whole, so a clip that keeps each line's start still keeps
+# every entry's first fields (its id or name).
+_GUTTER_RE = re.compile(r"^( *\d+\t)(.*)$")
+
+
+def _json_value(text: str):
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, (dict, list)) else None
+
+
+def _dump(value) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _has_entries(value) -> bool:
+    return isinstance(value, list) and any(isinstance(v, (dict, list)) for v in value)
+
+
+def _dump_lines(value, indent: str = "") -> str:
+    """Compact JSON with each entry of a list of objects or lists whole on one line of its own."""
+    inner = indent + " "
+    if _has_entries(value):
+        return "[\n" + ",\n".join(inner + _dump(v) for v in value) + "\n" + indent + "]"
+    if isinstance(value, dict) and any(_has_entries(v) for v in value.values()):
+        return "{\n" + ",\n".join(inner + _dump(k) + ":" + _dump_lines(v, inner) for k, v in value.items()) + "\n" + indent + "}"
+    return _dump(value)
+
+
+def compact_text(text: str) -> str:
+    """Text with its JSON rewritten compactly: one JSON value (read with line numbers or not), or JSON lines."""
+    lines = text.split("\n")
+    gutters = [_GUTTER_RE.match(line) for line in lines]
+    numbered = len(lines) > 1 and all(g or not line.strip() for g, line in zip(gutters, lines))
+    whole = _json_value("\n".join(g.group(2) if g else line for g, line in zip(gutters, lines)) if numbered else text)
+    if whole is not None:
+        return _dump_lines(whole)
+    out = []
+    for g, line in zip(gutters, lines):
+        prefix, body = (g.group(1), g.group(2)) if g else ("", line)
+        value = _json_value(body)
+        out.append(line if value is None else prefix + _dump(value))
+    return "\n".join(out)
+
+
+def compact_input(text: str) -> str:
+    fields = json_object(text)
+    if fields is None:
+        return compact_text(text)
+    return json.dumps({k: compact_text(v) if isinstance(v, str) else v for k, v in fields.items()}, ensure_ascii=False)
+
+
+def compact_action(action: dict) -> dict:
+    return {**action, "input": compact_input(action["input"]), "result": compact_text(action["result"])}
+
+
 def fill(actions: list[dict], tokens: float, clipped, evidence: tuple[set[str], set[str]], stems: set[str]) -> list[dict]:
     """The actions whole if they fit `tokens`, else each input and result cut to the largest length that
     fits, or `clipped` if even the fixed clips don't."""
@@ -1186,6 +1245,8 @@ def build_state(
             {**a, "result": with_pytest_counts(a["result"])} if _PYTEST_PROGRESS_RE.fullmatch(a["result"].strip()) else a
             for a in actions
         ]
+    actions = [compact_action(a) for a in actions]
+    earlier = [compact_action(a) for a in earlier]
 
     def clipped(a: dict) -> dict:
         return {**a, "input": clip_input(a["input"], evidence, stems), "result": clip_result(a["result"], evidence)}

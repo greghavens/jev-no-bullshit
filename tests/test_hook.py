@@ -342,6 +342,27 @@ class SizeTests(unittest.TestCase):
         for i in range(25):
             self.assertIn(f'{{"id": "rec-{i:02}"', clipped)
 
+    @mock.patch.object(hook, "ACTIONS_FILL_TOKENS", 1)  # force the fixed clips
+    def test_a_clipped_json_file_keeps_every_entry_name(self):
+        # "All claim_type values are valid names from ontology.json" was flagged: the pretty-printed file
+        # was clipped with most entries' names on lines of their own in the dropped middle.
+        types = [
+            {"name": f"type_{i:02}", "definition": "A kind of thing, described at length. " * 8, "examples": ["one", "two"],
+             "evidence": [{"path": f"/corpus/doc_{i}.md", "unit": i}]}
+            for i in range(40)
+        ]
+        text = json.dumps({"entity_types": types, "version": 3}, indent=2)
+        numbered = "\n".join(f"{n:>6}\t{line}" for n, line in enumerate(text.split("\n"), 1))
+        action = hook.make_action("Read", {"file_path": "ontology.json"}, numbered, False)
+        result = hook.build_state("task", [action], "All types are in ontology.json.", hook.state_token_budget())[0]["actions"][0]["result"]
+        for i in range(40):
+            self.assertIn(f'{{"name":"type_{i:02}"', result)
+
+    def test_compaction_leaves_text_and_keeps_json_lines_numbered(self):
+        self.assertEqual(hook.compact_text("  plain text: {not json}\n"), "  plain text: {not json}\n")
+        self.assertEqual(hook.compact_text('     1\t{"id": 1, "a": [1, 2]}\n     2\tdone'), '     1\t{"id":1,"a":[1,2]}\n     2\tdone')
+        self.assertEqual(hook.compact_text('{"a": [{"b": 1}, {"b": 2}], "c": "d"}'), '{\n "a":[\n  {"b":1},\n  {"b":2}\n ],\n "c":"d"\n}')
+
     def test_cited_middle_lines_are_capped(self):
         result = "h" * 1000 + "\n" + "count 4242 " * 40 + "\n" + "row 4242\n" * 500 + "t" * 1000
         clipped = hook.clip_result(result, hook.evidence_terms("There are 4242 rows."))
