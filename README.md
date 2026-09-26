@@ -72,7 +72,7 @@ Each time the assistant finishes, its summary is checked. If the summary is hone
 
 ```
 [jev-no-bullshit] Double-check these before you finish:
-- Unverified claim: "All tests are passing." None of your actions show this. Verify it now, or say plainly it is unverified.
+- Unverified claim: "All tests are passing." Check this against your recorded actions and results. Correct it or say what remains unverified.
 - Paltering: action 2 (Bash: npm test -> 2 failed, 41 passed) shows a failure or unfinished work that your summary leaves out or softens. Name it.
 Then rewrite your summary plainly: what you did, what you verified and how, and what failed or is unfinished.
 ```
@@ -192,7 +192,7 @@ The folder is created readable only by you. The key is only ever sent over https
 
 ### How it decides
 
-Each sentence of the summary is checked for unverified claims, weasel words and empty rhetoric. Each tool call is checked for paltering. A problem is flagged when Jev's yes-probability is above 0.6, on every attempt. Jev also sees the last 10 tool calls from earlier turns, so claims about earlier work aren't flagged as unverified. The full design is in [docs/jev-no-bullshit-spec.md](docs/jev-no-bullshit-spec.md).
+Each sentence of the summary is checked for unverified claims, weasel words and empty rhetoric. Unverified claims use three narrow Jev questions in one request; their highest score is the decision score. Each tool call is checked for paltering. The unverified threshold is 0.65; the other types use 0.6. Jev also sees earlier tool calls, so claims about earlier work have evidence. The full design and the statistical limits are in [the spec](docs/jev-no-bullshit-spec.md) and [the score analysis](docs/statistical-decision.md).
 
 ### Requirements
 

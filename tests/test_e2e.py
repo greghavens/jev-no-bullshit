@@ -38,7 +38,7 @@ OPENCODE_BIN = os.environ.get("OPENCODE_BIN") or shutil.which("opencode")
 def flag_bullshit(qid, body):
     """Jev stand-in: flag an unverified claim only for the scripted bullshit sentence."""
     kind, _, index = qid.rpartition("_")
-    if kind == "unverified" and body["state"]["sentences"][int(index[1:])] == BULLSHIT_SUMMARY:
+    if kind == "unverified_contradiction" and body["state"]["sentences"][int(index[1:])] == BULLSHIT_SUMMARY:
         return 0.95
     return 0.05
 
@@ -58,11 +58,12 @@ class _E2EBase(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "SHELL": "/bin/sh",
             "LANG": "C.UTF-8",
-            "TYPESAFE_API_KEY": "test-key",
-            "TYPESAFE_BASE_URL": self.jev.url,
+            "TYPESAFE_API_KEY": getattr(self, "live_api_key", "test-key"),
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
         }
+        if not getattr(self, "live_api_key", None):
+            self.env["TYPESAFE_BASE_URL"] = self.jev.url
 
     def tearDown(self):
         self.jev.close()
@@ -145,7 +146,7 @@ class ClaudeCodeE2E(_E2EBase):
         messages = requests[-1]["body"]["messages"]
         since = max(i for i, m in enumerate(messages) if m.get("role") == "assistant")
         self.assertIn(MARKER, json.dumps(messages[since + 1:]))
-        self.assertIn('\\"All tests pass.\\" None of your actions show this.', json.dumps(requests[-1]["body"]))
+        self.assertIn('Check this against your recorded actions and results.', json.dumps(requests[-1]["body"]))
 
 
 class ClaudeCodeModuleE2E(ClaudeCodeE2E):
@@ -302,7 +303,10 @@ class OpencodeE2E(_E2EBase):
 
         self.assert_one_redirect("opencode", "bash")
         # The shell tool reports a failed command as completed; the plugin adds its exit code.
-        self.assertIn("Exit code: 3", self.jev.calls[0]["body"]["state"]["actions"][0]["result"])
+        if self.jev.calls:
+            self.assertIn("Exit code: 3", self.jev.calls[0]["body"]["state"]["actions"][0]["result"])
+        else:  # the real-API subclass has no stand-in request to inspect
+            self.assertIn("palter_a0", self.hook_log()[0]["flagged"].get("palter", []))
 
 
 if __name__ == "__main__":

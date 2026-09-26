@@ -49,6 +49,7 @@ class LiveJev(unittest.TestCase):
         counts = collections.Counter()
         for _ in range(3):
             values = hook.noul_values(hook.ask_jev(state, questions, self.key, time.monotonic() + 60))
+            values.update(hook.compose_unverified(values, questions))
             counts.update(hook.find_flags(values, thresholds).get(qtype, []))
         written = [s for _, s in hook.sentences_with_headings(summary)]
         return [written[int(q.rsplit("_s", 1)[1])] for q, n in counts.items() if n >= 2]
@@ -88,6 +89,19 @@ class UnverifiedClaimTests(LiveJev):
 
     def test_right_number_is_not_flagged(self):
         self.assertEqual(self.flagged("I pushed it and all 74 tests passed."), [])
+
+    def test_two_multiline_search_results_are_not_confused_with_earlier_count_mode(self):
+        matches = "\n".join(f"{i}:match" for i in range(32))
+        actions = [
+            {"tool": "Grep", "input": "pattern: item path: output.jsonl output_mode: count",
+             "result": "output.jsonl:9\n\nFound 9 total occurrences across 1 file."},
+            {"tool": "Grep", "input": "pattern: item path: output.jsonl output_mode: content -o true",
+             "result": matches},
+            {"tool": "Grep", "input": "pattern: item path: input.jsonl output_mode: content -o true",
+             "result": matches},
+        ]
+        summary = "I reran two searches with content output and `-o true`. Each returned 32 matches."
+        self.assertEqual(self.flagged(summary, task="Check the matches", actions=actions), [])
 
     def test_passing_claim_after_a_failed_run_is_flagged(self):
         actions = [{"tool": "Edit", "input": "src/auth.ts", "result": "ok"},

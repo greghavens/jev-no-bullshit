@@ -21,6 +21,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -31,7 +32,8 @@ from test_hook import SCRIPT, claude_transcript  # noqa: E402
 
 API_KEY = os.environ.get("TYPESAFE_API_KEY", "").strip()
 SKIP = "TYPESAFE_API_KEY is not set; live tests call the real TypeSafe API"
-QUESTION_TYPES = ("unverified", "weasel", "rhetoric", "palter")
+QUESTION_TYPES = ("unverified_action", "unverified_contradiction", "unverified_missing_check",
+                  "weasel", "rhetoric", "palter")
 
 
 def live_env(home: Path) -> dict:
@@ -93,7 +95,7 @@ class HookLiveTests(LiveChecks, unittest.TestCase):
 
     @staticmethod
     def question_ids(sentences, actions=2):
-        return [f"{t}_s{i}" for i in range(sentences) for t in QUESTION_TYPES[:3]] + [f"palter_a{j}" for j in range(actions)]
+        return [f"{t}_s{i}" for i in range(sentences) for t in QUESTION_TYPES[:5]] + [f"palter_a{j}" for j in range(actions)]
 
     def test_spec_example_is_redirected(self):
         # Actions: Edit src/auth.ts -> ok; Bash npm test -> "2 failed, 41 passed" (error).
@@ -166,19 +168,26 @@ class _CLILive(LiveChecks):
     """Replace the Jev stand-in in test_e2e with the real API; the model stays scripted."""
 
     def setUp(self):
+        # opencode starts its server during super().setUp(), so the real key
+        # and endpoint choice must be known before that process is spawned.
+        self.live_api_key = API_KEY
         super().setUp()
         self.env.update({k: v for k, v in os.environ.items()
                          if k.upper() in ("HTTPS_PROXY", "HTTP_PROXY", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
                                           "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE")})
         self.env["TYPESAFE_API_KEY"] = API_KEY
-        del self.env["TYPESAFE_BASE_URL"]
+        self.env.pop("TYPESAFE_BASE_URL", None)
 
     def assert_one_redirect(self, tool, tool_name):
+        deadline = time.monotonic() + 20
         log = self.hook_log()
+        while len(log) < 2 and time.monotonic() < deadline:
+            time.sleep(0.2)
+            log = self.hook_log()
         self.assertEqual(len(log), 2, "\n".join(show(c) for c in log))
         first, second = log
         # One sentence, one action (the failing command).
-        self.assert_real_answer(first, ["unverified_s0", "weasel_s0", "rhetoric_s0", "palter_a0"])
+        self.assert_real_answer(first, [f"{t}_s0" for t in QUESTION_TYPES[:5]] + ["palter_a0"])
         self.assertEqual(first["tool"], tool)
         self.assertEqual(first["summary"], BULLSHIT_SUMMARY)
         self.assertEqual(first["missing_tool_results"], 0)
@@ -199,6 +208,18 @@ class ClaudeCodeLive(_CLILive, test_e2e.ClaudeCodeE2E):
 @unittest.skipUnless(API_KEY, SKIP)
 @unittest.skipUnless(test_e2e.CODEX_BIN, "codex CLI not found (set CODEX_BIN)")
 class CodexLive(_CLILive, test_e2e.CodexE2E):
+    pass
+
+
+@unittest.skipUnless(API_KEY, SKIP)
+@unittest.skipUnless(test_e2e.PI_BIN, "pi CLI not found (set PI_BIN)")
+class PiLive(_CLILive, test_e2e.PiE2E):
+    pass
+
+
+@unittest.skipUnless(API_KEY, SKIP)
+@unittest.skipUnless(test_e2e.OPENCODE_BIN, "opencode CLI not found (set OPENCODE_BIN)")
+class OpencodeLive(_CLILive, test_e2e.OpencodeE2E):
     pass
 
 
