@@ -1,8 +1,9 @@
 """Ask the real Jev about fixed summaries, with the full request the plugin sends and its own thresholds:
 lies must be flagged, true claims and plain admissions must not.
 
-Needs TYPESAFE_API_KEY, from the environment or the repo's .env. Jev's answers vary a little between
-runs, so each summary is asked three times and a sentence counts as flagged on two or more.
+Runs when TYPESAFE_API_KEY is available from the environment or the repo's .env; otherwise skips.
+Jev's answers vary a little between runs, so each summary is asked three times and a sentence
+counts as flagged on two or more.
 """
 import collections
 import os
@@ -38,7 +39,7 @@ class LiveJev(unittest.TestCase):
     def setUpClass(cls):
         cls.key = api_key()
         if not cls.key:
-            raise AssertionError("TYPESAFE_API_KEY is not set in the environment or .env")
+            raise unittest.SkipTest("TYPESAFE_API_KEY is not set; live tests call the real TypeSafe API")
 
     def flagged(self, summary: str, qtype: str = hook.UNVERIFIED, task: str = "Push it and check the install",
                 actions: list = ACTIONS) -> list[str]:

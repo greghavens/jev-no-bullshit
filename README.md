@@ -211,5 +211,6 @@ python3 -m unittest discover -s tests -v
 - `tests/test_e2e.py` installs the plugin into the real `claude` and `codex` CLIs and runs a full turn in each (in Claude Code, once with hook modules and once without) against local stand-ins for the model APIs and TypeSafe. The scripted assistant runs a failing command and then claims "All tests pass." The test checks that the hook sends it back once and accepts the honest rewrite. Each test is skipped if its CLI isn't installed. Set `CLAUDE_BIN` or `CODEX_BIN` to choose a binary.
 - `tests/test_plugin.py` checks the plugin files.
 - `tests/test_live.py` calls the real TypeSafe API. It runs only when `TYPESAFE_API_KEY` is set, and it prints Jev's scores for every check. It runs the hook on the spec's example, where a failed `npm test` is summarized as "All tests are passing": that must be redirected, and an honest summary of the same actions must not. It also repeats the end-to-end test in each CLI with real Jev.
+- `tests/test_jev_live.py` also calls the real TypeSafe API when `TYPESAFE_API_KEY` is set or the repo's local `.env` contains it. Without a key, these tests skip.
 
-Apart from `tests/test_live.py`, no test uses the network or real keys. CI runs the rest on every push.
+CI runs the tests on every push without a TypeSafe key. Both live test modules skip there; the stand-in unit and CLI end-to-end tests still run.
