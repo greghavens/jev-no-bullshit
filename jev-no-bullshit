@@ -400,18 +400,18 @@ def harness_key_file() -> Path:
 
 
 def read_key(name: str, path: Path) -> str:
-    """`name` from the environment, else from `path`, as `NAME=...` lines.
+    """`name` from `path`, as `NAME=...` lines, else from the environment.
 
-    The file is read here, never sourced, so the key stays out of every other process's environment.
-    A line that exports the key is refused: sourced from a shell profile, it would put the key there.
+    The file wins, so a key set there is used only by this plugin even when the same variable is set
+    for every tool, as it is in Claude Code's settings. The file is read here, never sourced, so the key
+    stays out of every other process's environment. A line that exports the key is refused: sourced from
+    a shell profile, it would put the key there.
     """
-    key = os.environ.get(name, "").strip()
-    if key:
-        return key
     try:
         lines = path.read_text().splitlines()
     except OSError:
-        return ""
+        lines = []
+    key = ""
     for line in lines:
         if re.match(rf"\s*export\s+{name}\s*=", line):
             raise ValueError(f"{path} exports {name}; write it as {name}=... without export, and don't source the file")
@@ -420,20 +420,20 @@ def read_key(name: str, path: Path) -> str:
             key = match.group(1).strip()
             if len(key) >= 2 and key[0] == key[-1] and key[0] in "'\"":
                 key = key[1:-1].strip()
-    return key
+    return key or os.environ.get(name, "").strip()
 
 
 def api_key() -> str:
-    """TYPESAFE_API_KEY from the environment, else from key_file().
+    """TYPESAFE_API_KEY from key_file(), else from the environment.
 
-    A host that doesn't start from the person's shell profile (or one they set the key for only in
-    another host's settings) still finds the key there.
+    Every host finds the key there however it was started, and it is this plugin's own: a
+    TYPESAFE_API_KEY set for other tools is used only when the file has none.
     """
     return read_key("TYPESAFE_API_KEY", key_file())
 
 
 def harness_api_key() -> str:
-    """JEV_API_KEY from the environment, else from harness_key_file().
+    """JEV_API_KEY from harness_key_file(), else from the environment.
 
     The replay tools and live tests use only this key, never the plugin's, so their calls are billed
     and rate-limited apart from the checks the plugin makes in real sessions.

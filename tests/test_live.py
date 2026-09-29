@@ -43,7 +43,9 @@ SENTENCE_QUESTIONS = ("unverified_action", "unverified_contradiction", "unverifi
 
 def live_env(home: Path) -> dict:
     """The real environment (key, proxy, CA bundle) with a throwaway HOME and no TypeSafe URL override."""
-    env = {k: v for k, v in os.environ.items() if k != "TYPESAFE_BASE_URL"}
+    # Without XDG_CONFIG_HOME the hook looks for its key file under the throwaway HOME, so the plugin's own
+    # key file, which wins over the environment, is never read.
+    env = {k: v for k, v in os.environ.items() if k not in ("TYPESAFE_BASE_URL", "XDG_CONFIG_HOME")}
     env["TYPESAFE_API_KEY"] = API_KEY  # the harness's key, never the plugin's
     env["HOME"] = str(home)
     env["JEV_NO_BULLSHIT_MODULE"] = "1"  # the script runs as Claude Code's hooks module runs it

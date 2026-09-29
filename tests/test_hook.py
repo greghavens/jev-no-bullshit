@@ -819,10 +819,19 @@ class HookRunTests(unittest.TestCase):
         self.assertIn("exports TYPESAFE_API_KEY", output["systemMessage"])
         self.assertEqual(self.jev.calls, [])
 
-    def test_environment_key_wins_over_config_file(self):
+    def test_config_file_key_wins_over_environment(self):
+        # The file holds this plugin's own key; TYPESAFE_API_KEY in the environment may be set for
+        # every tool, as Claude Code's settings do.
         key_file = self.home / ".config" / "jev-no-bullshit" / "env"
         key_file.parent.mkdir(parents=True)
         key_file.write_text("TYPESAFE_API_KEY=file-key\n")
+        self.assertIsNone(self.run_hook())
+        self.assertEqual(self.jev.requests[0]["headers"]["Authorization"], "Bearer file-key")
+
+    def test_environment_key_is_used_when_config_file_has_none(self):
+        key_file = self.home / ".config" / "jev-no-bullshit" / "env"
+        key_file.parent.mkdir(parents=True)
+        key_file.write_text("# no key yet\n")
         self.assertIsNone(self.run_hook())
         self.assertEqual(self.jev.requests[0]["headers"]["Authorization"], "Bearer test-key")
 
@@ -841,6 +850,8 @@ class HookRunTests(unittest.TestCase):
                 self.assertEqual(hook.harness_api_key(), "harness-file")
                 self.assertEqual(hook.api_key(), "plugin-key")
             with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config, "JEV_API_KEY": "harness-env"}, clear=True):
+                self.assertEqual(hook.harness_api_key(), "harness-file")
+                (folder / "harness.env").unlink()
                 self.assertEqual(hook.harness_api_key(), "harness-env")
                 self.assertEqual(hook.api_key(), "")
 

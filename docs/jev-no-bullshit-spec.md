@@ -122,7 +122,7 @@ Each flagged sentence or action gets one line:
 
 ## Wiring
 
-One Python script (standard library only) serves both tools, since their Stop input and output match. It reads `TYPESAFE_API_KEY` from the environment. It can tell Codex from the `turn_id` field in the input, which only Codex sends; that decides how it parses the transcript.
+One Python script (standard library only) serves both tools, since their Stop input and output match. It reads `TYPESAFE_API_KEY` from `~/.config/jev-no-bullshit/env`, else from the environment, so a key in that file is the plugin's own even when the environment sets another for every tool. It can tell Codex from the `turn_id` field in the input, which only Codex sends; that decides how it parses the transcript.
 
 **Claude Code** needs v2.1.196 or later for `last_assistant_message`. Add this to `.claude/settings.json` (project) or `~/.claude/settings.json` (user):
 

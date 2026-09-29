@@ -26,7 +26,7 @@ printf 'TYPESAFE_API_KEY=%s\n' "your-key-here" > ~/.config/jev-no-bullshit/env
 chmod 600 ~/.config/jev-no-bullshit/env
 ```
 
-The plugin reads this file itself, however the assistant was started. Don't source it from your shell profile or write `export` in it, or the key ends up in every program's environment; a line with `export` is refused and the reply goes unchecked. Keep the key out of git. Don't put it in a project's settings file.
+The plugin reads this file itself, however the assistant was started. A key here is used only by this plugin, and it wins over a `TYPESAFE_API_KEY` set in your environment or in Claude Code's settings for other tools. Don't source it from your shell profile or write `export` in it, or the key ends up in every program's environment; a line with `export` is refused and the reply goes unchecked. Keep the key out of git. Don't put it in a project's settings file.
 
 ### 2. Install the plugin
 
@@ -183,6 +183,8 @@ export JEV_NO_BULLSHIT_MAX_REDIRECTS=3
 It must be a whole number of at least 1; any other value is treated as 1.
 
 ### Other ways to set the key
+
+These are used only when `~/.config/jev-no-bullshit/env` has no key, and they share the key with every other tool that reads `TYPESAFE_API_KEY`.
 
 - **Claude Code only**: add it to your user settings file, `~/.claude/settings.json`, as `{"env": {"TYPESAFE_API_KEY": "..."}}`.
 - **Claude Code on the web**: open the cloud environment's settings, add `TYPESAFE_API_KEY` as an environment variable, and allow `api.typesafe.ai` under network access.
