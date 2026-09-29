@@ -746,24 +746,44 @@ class HookRunTests(unittest.TestCase):
 
     def test_fails_open_without_api_key(self):
         del self.env["TYPESAFE_API_KEY"]
-        self.assertIsNone(self.run_hook())
+        output = self.run_hook()
+        self.assertNotIn("decision", output)
+        self.assertIn("did not check this reply: TYPESAFE_API_KEY is not set", output["systemMessage"])
         self.assertEqual(self.jev.calls, [])
         self.assertIn("TYPESAFE_API_KEY", self.log_lines()[-1]["error"])
 
+    def test_reads_key_from_config_file(self):
+        del self.env["TYPESAFE_API_KEY"]
+        key_file = self.home / ".config" / "jev-no-bullshit" / "env"
+        key_file.parent.mkdir(parents=True)
+        key_file.write_text("# key\nexport TYPESAFE_API_KEY=\"file-key\"\n")
+        self.assertIsNone(self.run_hook())
+        self.assertEqual(self.jev.requests[0]["headers"]["Authorization"], "Bearer file-key")
+
+    def test_environment_key_wins_over_config_file(self):
+        key_file = self.home / ".config" / "jev-no-bullshit" / "env"
+        key_file.parent.mkdir(parents=True)
+        key_file.write_text("TYPESAFE_API_KEY=file-key\n")
+        self.assertIsNone(self.run_hook())
+        self.assertEqual(self.jev.requests[0]["headers"]["Authorization"], "Bearer test-key")
+
     def test_fails_open_on_http_error(self):
         self.jev.status = 500
-        self.assertIsNone(self.run_hook())
+        output = self.run_hook()
+        self.assertEqual(list(output), ["systemMessage"])
+        self.assertIn("HTTP 500", output["systemMessage"])
         self.assertIn("HTTP 500", self.log_lines()[-1]["error"])
 
     def test_fails_open_on_wrong_endpoint(self):
         # The hook logs the server's status and message and lets the turn end.
         self.env["TYPESAFE_BASE_URL"] = self.jev.url + "/wrong-prefix"
-        self.assertIsNone(self.run_hook())
+        self.assertIn("HTTP 404", self.run_hook()["systemMessage"])
         self.assertIn("HTTP 404", self.log_lines()[-1]["error"])
 
     def test_fails_open_on_bad_input(self):
         proc = subprocess.run([sys.executable, str(SCRIPT)], input="not json", capture_output=True, text=True, env=self.env)
-        self.assertEqual((proc.returncode, proc.stdout), (0, ""))
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(list(json.loads(proc.stdout)), ["systemMessage"])
 
     def test_plain_stop_hook_checks_where_the_module_did_not(self):
         # Where Claude Code does not load hooks modules, the plain Stop hook is the check.
@@ -790,7 +810,7 @@ class HookRunTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env), mock.patch.object(hook, "JEV_TIMEOUT_SECONDS", 0.2):
             output = hook.run({"session_id": "sess-1", "transcript_path": str(self.transcript),
                                "stop_hook_active": False, "last_assistant_message": "Done."})
-        self.assertIsNone(output)
+        self.assertEqual(list(output), ["systemMessage"])  # lets the turn end, says it went unchecked
         self.assertIn("Jev call failed", self.log_lines()[-1]["error"])
 
     def test_timeout_bounds_the_whole_call(self):
@@ -806,19 +826,19 @@ class HookRunTests(unittest.TestCase):
             output = hook.run({"session_id": "sess-1", "transcript_path": str(self.transcript),
                                "stop_hook_active": False, "last_assistant_message": "Done."})
             elapsed = time.monotonic() - start
-        self.assertIsNone(output)
+        self.assertEqual(list(output), ["systemMessage"])  # lets the turn end, says it went unchecked
         self.assertLess(elapsed, 1.5)
         self.assertIn("TimeoutError", self.log_lines()[-1]["error"])
 
     def test_key_is_never_sent_over_plain_http_to_another_host(self):
         self.env["TYPESAFE_BASE_URL"] = "http://api.typesafe.ai"
-        self.assertIsNone(self.run_hook())
+        self.assertEqual(list(self.run_hook()), ["systemMessage"])
         self.assertIn("must be an https URL", self.log_lines()[-1]["error"])
 
     def test_redirects_are_not_followed(self):
         # Following one would resend the Authorization header to the redirect target.
         self.jev.status, self.jev.location = 302, self.jev.url + "/elsewhere"
-        self.assertIsNone(self.run_hook())
+        self.assertEqual(list(self.run_hook()), ["systemMessage"])
         self.assertEqual([r["path"] for r in self.jev.requests], ["/v1/systemone"])
         self.assertIn("HTTP 302", self.log_lines()[-1]["error"])
 
@@ -832,7 +852,7 @@ class HookRunTests(unittest.TestCase):
         self.env["TYPESAFE_API_KEY"] = ""
         proc = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True, text=True, env=self.env,
                               input=json.dumps({"session_id": "s", "last_assistant_message": "Done."}))
-        self.assertEqual((proc.returncode, proc.stdout), (0, ""))
+        self.assertEqual((proc.returncode, list(json.loads(proc.stdout))), (0, ["systemMessage"]))
         self.assertIn("cannot write log", proc.stderr)
 
     def use_full_transcript(self):
@@ -860,7 +880,7 @@ class HookRunTests(unittest.TestCase):
     def test_fails_open_when_still_too_long(self):
         self.use_full_transcript()
         self.jev.too_long = 2
-        self.assertIsNone(self.run_hook())
+        self.assertEqual(list(self.run_hook()), ["systemMessage"])
         self.assertEqual(len(self.jev.calls), 2)
         log = self.log_lines()[-1]
         self.assertIn("JevTooLong: HTTP 400", log["error"])
@@ -868,7 +888,7 @@ class HookRunTests(unittest.TestCase):
 
     def test_small_request_refused_as_too_long_is_not_resent(self):
         self.jev.too_long = 1
-        self.assertIsNone(self.run_hook())
+        self.assertEqual(list(self.run_hook()), ["systemMessage"])
         self.assertEqual(len(self.jev.calls), 1)
         log = self.log_lines()[-1]
         self.assertIn("JevTooLong: HTTP 400", log["error"])

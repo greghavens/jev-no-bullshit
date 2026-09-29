@@ -105,9 +105,11 @@ Every check is logged. To see the latest one:
 tail -n 1 ~/.jev-no-bullshit/log.jsonl
 ```
 
-If a line says `"error": "TYPESAFE_API_KEY is not set"`, the assistant can't see your key. Set it as in step 1 and restart the assistant from a new terminal. If you start Claude Code some other way than from a terminal, see [Other ways to set the key](#other-ways-to-set-the-key).
+When a check can't run, you're told on screen: Codex shows a warning below the reply, and Claude Code pins it on the status line under the prompt until a check succeeds. The message starts with `jev-no-bullshit did not check this reply`.
 
-If jev-no-bullshit itself runs into a problem (no key, no network, Jev takes more than 10 seconds), it logs the problem and lets the assistant finish normally. A problem with the check never holds up your work.
+If it says `TYPESAFE_API_KEY is not set`, the assistant can't see your key. Set it as in step 1 and restart the assistant from a new terminal. If you start Claude Code some other way than from a terminal, see [Other ways to set the key](#other-ways-to-set-the-key).
+
+If jev-no-bullshit itself runs into a problem (no key, no network, Jev takes more than 10 seconds), it logs the problem, shows the warning above, and lets the assistant finish normally. A problem with the check never holds up your work.
 
 ### Privacy
 
@@ -180,6 +182,7 @@ It must be a whole number of at least 1; any other value is treated as 1.
 
 ### Other ways to set the key
 
+- **Any assistant**: put `TYPESAFE_API_KEY=your-key-here` in `~/.config/jev-no-bullshit/env` (run `chmod 600` on it). It's read when the variable isn't set in the environment, so it works however the assistant was started.
 - **Claude Code only**: add it to your user settings file, `~/.claude/settings.json`, as `{"env": {"TYPESAFE_API_KEY": "..."}}`.
 - **Claude Code on the web**: open the cloud environment's settings, add `TYPESAFE_API_KEY` as an environment variable, and allow `api.typesafe.ai` under network access.
 

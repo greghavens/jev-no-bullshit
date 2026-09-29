@@ -6,8 +6,9 @@ final summary bullshits about what it did, measured against the tool calls it
 actually made. If Jev flags a type of bullshit, send the model back with
 feedback on that type. See docs/jev-no-bullshit-spec.md.
 
-Standard library only. Reads TYPESAFE_API_KEY from the environment. Always
-exits 0 and fails open: any error lets the turn end.
+Standard library only. Reads TYPESAFE_API_KEY from the environment, or else
+from ~/.config/jev-no-bullshit/env. Always exits 0 and fails open: any error
+lets the turn end, with a systemMessage saying the reply was not checked.
 
 Claude Code and Codex send a Stop event naming their transcript. The pi and
 opencode plugins (pi/, opencode/) have no transcript file to name, so they send
@@ -305,6 +306,38 @@ def log(entry: dict) -> None:
     except OSError as error:
         # Nowhere to log: stderr at least shows up in the hook's debug output.
         print(f"jev-no-bullshit: cannot write log ({error}): {json.dumps(entry)}", file=sys.stderr)
+
+
+def key_file() -> Path:
+    config = os.environ.get("XDG_CONFIG_HOME", "").strip() or str(Path.home() / ".config")
+    return Path(config) / "jev-no-bullshit" / "env"
+
+
+def api_key() -> str:
+    """TYPESAFE_API_KEY from the environment, else from key_file(), as `[export ]TYPESAFE_API_KEY=...` lines.
+
+    A host that doesn't start from the person's shell profile (or one they set the key for only in
+    another host's settings) still finds the key there.
+    """
+    key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        lines = key_file().read_text().splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        match = re.match(r"\s*(?:export\s+)?TYPESAFE_API_KEY\s*=\s*(.*)$", line)
+        if match:
+            key = match.group(1).strip()
+            if len(key) >= 2 and key[0] == key[-1] and key[0] in "'\"":
+                key = key[1:-1].strip()
+    return key
+
+
+def unchecked(error: str) -> dict:
+    """Hook output that lets the turn end but tells the person this reply was not checked, and why."""
+    return {"systemMessage": f"jev-no-bullshit did not check this reply: {error}. Details: ~/.jev-no-bullshit/log.jsonl"}
 
 
 def positive_setting(name: str, default: int) -> int:
@@ -1634,10 +1667,11 @@ def run(hook_input: dict) -> dict | None:
     if not summary.strip():
         log({**base, "skipped": "no last_assistant_message"})
         return None
-    api_key = os.environ.get("TYPESAFE_API_KEY", "").strip()
-    if not api_key:
-        log({**base, "error": "TYPESAFE_API_KEY is not set", "summary": summary})
-        return None
+    key = api_key()
+    if not key:
+        error = f"TYPESAFE_API_KEY is not set in this environment or in {key_file()}"
+        log({**base, "error": error, "summary": summary})
+        return unchecked(error)
 
     if host:
         task, actions, transcript_model, pending, earlier = given_turn(hook_input)
@@ -1669,10 +1703,11 @@ def run(hook_input: dict) -> dict | None:
             return None
         if base.get("refused_estimated_tokens", float("inf")) <= base["estimated_tokens"]:
             # Everything already fit the smaller budget, so the refusal isn't about size: don't resend it.
-            log({**base, "error": f"Jev call failed: {type(refused).__name__}: {refused}", "summary": summary})
-            return None
+            error = f"Jev call failed: {type(refused).__name__}: {refused}"
+            log({**base, "error": error, "summary": summary})
+            return unchecked(error)
         try:
-            response = ask_jev(state, questions, api_key, deadline)
+            response = ask_jev(state, questions, key, deadline)
             values = noul_values(response)
             break
         except (urllib.error.URLError, OSError, ValueError, TypeError) as error:
@@ -1681,8 +1716,9 @@ def run(hook_input: dict) -> dict | None:
                 base["refused_estimated_tokens"] = base["estimated_tokens"]
                 refused = error
                 continue
-            log({**base, "error": f"Jev call failed: {type(error).__name__}: {error}", "summary": summary})
-            return None
+            message = f"Jev call failed: {type(error).__name__}: {error}"
+            log({**base, "error": message, "summary": summary})
+            return unchecked(message)
 
     # Answers without a numeric noul are ignored; log them, or an API change would silently flag nothing.
     unanswered = sorted(set(questions) - set(values))
@@ -1731,8 +1767,9 @@ def main() -> int:
             raise ValueError("hook input is not a JSON object")
         output = run(hook_input)
     except Exception as error:  # fail open: never trap the model
-        log({"error": f"unexpected: {type(error).__name__}: {error}"})
-        return 0
+        message = f"unexpected: {type(error).__name__}: {error}"
+        log({"error": message})
+        output = unchecked(message)
     if output is not None:
         sys.stdout.write(json.dumps(output))
     return 0

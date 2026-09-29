@@ -6,17 +6,24 @@ const FEEDBACK = "[jev-no-bullshit] Double-check these before you finish: ..."
 // Stands in for the engine: runs the checker script by handing out the next
 // verdict, and records what the plugin submits, the environment each check
 // ran with, and the order of checks and Stop hooks.
-function engine(on: any, verdicts: (string | undefined)[], opts: { stopBlocks?: string; env?: Record<string, string> } = {}) {
+function engine(on: any, verdicts: (string | undefined)[], opts: { stopBlocks?: string; env?: Record<string, string>; warnings?: (string | undefined)[] } = {}) {
   const submitted: { text: string; context?: string[] }[] = []
   const envs: Record<string, string>[] = []
   const order: string[] = []
+  const statuses: (string | undefined)[] = []
   on("process.run", (_$: any, e: any) => {
     order.push("check")
     envs.push(e.init?.env ?? {})
     const reason = verdicts.shift()
-    return { value: { exitCode: 0, stderr: "", stdout: reason ? JSON.stringify({ decision: "block", reason }) : "" } }
+    const warning = opts.warnings?.shift()
+    const stdout = reason ? JSON.stringify({ decision: "block", reason }) : warning ? JSON.stringify({ systemMessage: warning }) : ""
+    return { value: { exitCode: 0, stderr: "", stdout } }
   })
   on("ui.log", () => ({ value: undefined }))
+  on("ui.status", (_$: any, e: any) => {
+    statuses.push(e.text)
+    return { value: undefined }
+  })
   on("env.get", (_$: any, e: any) => ({ value: opts.env?.[e.name] }))
   on("prompt.submit", (_$: any, e: any) => {
     if (e.text.startsWith("[jev-no-bullshit]")) submitted.push({ text: e.text, context: e.context })
@@ -28,7 +35,7 @@ function engine(on: any, verdicts: (string | undefined)[], opts: { stopBlocks?: 
     return opts.stopBlocks ? { block: opts.stopBlocks } : {}
   })
   on("turn.complete", (_$: any, e: any) => ({ text: e.answer }))
-  return { submitted, envs, order }
+  return { submitted, envs, order, statuses }
 }
 
 // The end of a turn, as the engine raises it after the Stop hooks. The
@@ -115,4 +122,14 @@ test("JEV_NO_BULLSHIT_MAX_REDIRECTS raises the limit", async ($, on) => {
     await endTurn($, `reply ${i}`)
   }
   expect(submitted.length).toBe(3)
+})
+
+test("a check that could not run is pinned under the prompt until one does", async ($, on) => {
+  const warning = "jev-no-bullshit did not check this reply: TYPESAFE_API_KEY is not set"
+  const { submitted, statuses } = engine(on, [undefined, undefined], { warnings: [warning, undefined] })
+  expect((await stop($, REPLY)).block).toBeUndefined()
+  await endTurn($, REPLY)
+  expect(submitted).toEqual([])
+  await stop($, "Another reply.")
+  expect(statuses).toEqual([warning, undefined])
 })

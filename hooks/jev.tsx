@@ -50,8 +50,13 @@ export const register: Register = (on) => {
       })
       const output = run.stdout.trim() ? JSON.parse(run.stdout) : {}
       if (output.decision === "block" && typeof output.reason === "string" && output.reason.startsWith(TAG)) feedback = output.reason
+      // A check that could not run (no key, Jev unreachable) stays pinned under the prompt until one does.
+      const warning = output.decision !== "block" && typeof output.systemMessage === "string" ? output.systemMessage : undefined
+      $.ui.status(warning)
+      if (warning) $.ui.log(warning)
     } catch (error) {
-      $.ui.log(`jev-no-bullshit: check skipped: ${error}`) // fail open, as the script does
+      $.ui.status(`jev-no-bullshit did not check this reply: ${error}`) // fail open, as the script does
+      $.ui.log(`jev-no-bullshit: check skipped: ${error}`)
     }
     const result = await next(e)
     // Another Stop hook sent the model back already; one redirect at a time.
