@@ -136,7 +136,7 @@ class SentenceSplitTests(unittest.TestCase):
 
 class ThresholdTests(unittest.TestCase):
     def test_thresholds(self):
-        self.assertEqual([hook.threshold(k) for k in range(3)], [0.6, 0.6, 0.6])
+        self.assertEqual([hook.threshold(k) for k in range(3)], [0.7, 0.7, 0.7])
 
     def test_find_flags_is_strictly_above_threshold(self):
         thresholds = {t: 0.6 for t in hook.TYPES}
@@ -230,6 +230,36 @@ class TranscriptTests(unittest.TestCase):
         path = claude_transcript(self.dir / "t.jsonl", extra=extra)
         _, actions, _, _ = hook.parse_claude(hook.read_jsonl(str(path)))
         self.assertEqual(actions[-1]["result"], "Async agent launched successfully.\n" + note)
+
+    def test_conversation_keeps_the_previous_reply_when_the_reply_is_not_written_yet(self):
+        # The Stop hook ran before Claude Code wrote the reply "All 19 passed." to the transcript, so the
+        # last assistant message in the file was the previous reply. Dropping it as if it were the reply
+        # also dropped the request after it, and Jev flagged the true "all 19 passed" as unverified.
+        reply = "All 19 live tests passed."
+        def entry(n, role, content):
+            return {"type": role, "timestamp": f"2026-09-29T16:18:{n:02d}.000Z", "message": {"role": role, "content": content}}
+        entries = [
+            entry(0, "user", "Set the thresholds to 0.7"),
+            entry(1, "assistant", [{"type": "text", "text": "Done. The new live test hasn't run yet."}]),
+            entry(2, "user", "Run the test suite"),
+            entry(3, "assistant", [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "python3 -m unittest test_jev_live"}}]),
+            entry(4, "user", [{"type": "tool_result", "tool_use_id": "t1", "content": "Ran 19 tests in 13.0s\nOK"}]),
+        ]
+        expected = [
+            {"role": "user", "text": "Set the thresholds to 0.7"},
+            {"role": "assistant", "text": "Done. The new live test hasn't run yet."},
+            {"role": "user", "text": "Run the test suite"},
+        ]
+        self.assertEqual(hook.conversation_claude(entries, reply), expected)
+        written = entries + [entry(5, "assistant", [{"type": "text", "text": reply}])]
+        self.assertEqual(hook.conversation_claude(written, reply), expected)
+
+        items = [{"type": "response_item", "payload": {"type": "message", "role": m["role"], "content": [
+            {"type": "input_text" if m["role"] == "user" else "output_text", "text": m["text"]}]}} for m in expected]
+        self.assertEqual(hook.conversation_codex(items, reply), expected)
+        written = items + [{"type": "response_item", "payload": {"type": "message", "role": "assistant",
+                                                                  "content": [{"type": "output_text", "text": reply}]}}]
+        self.assertEqual(hook.conversation_codex(written, reply), expected)
 
     def test_codex_task_actions_and_model(self):
         extra = [

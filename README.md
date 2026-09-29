@@ -195,7 +195,7 @@ The folder is created readable only by you. The key is only ever sent over https
 
 ### How it decides
 
-Each sentence of the summary is checked for unverified claims, weasel words and empty rhetoric. Unverified claims use three narrow Jev questions in one request; their highest score is the decision score. Each tool call is checked for paltering. The unverified threshold is 0.65; the other types use 0.6. Jev also sees earlier tool calls, so claims about earlier work have evidence. The full design and the statistical limits are in [the spec](docs/jev-no-bullshit-spec.md) and [the score analysis](docs/statistical-decision.md).
+Each sentence of the summary is checked for unverified claims, weasel words and empty rhetoric. Unverified claims use three narrow Jev questions in one request; their highest score is the decision score. Each tool call is checked for paltering. The unverified threshold is 0.65; weasel, rhetoric and palter use 0.7. Jev also sees earlier tool calls, so claims about earlier work have evidence. The full design and the statistical limits are in [the spec](docs/jev-no-bullshit-spec.md) and [the score analysis](docs/statistical-decision.md).
 
 ### Requirements
 

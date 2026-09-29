@@ -24,7 +24,7 @@ Each check is one Jev call. A turn is checked after the model's first answer and
 
 ## Threshold
 
-The current unverified threshold is 0.65; weasel, rhetoric and palter use 0.6. The bar is the same on every attempt. Each sentence or action is called out at most `JEV_NO_BULLSHIT_MAX_CALLOUTS` times per turn (default 1), identified by the sentence's text or the action's tool, input and result, since indices shift between attempts. Without this, a revision that named a failure and then answered a later note without repeating it had the same failure flagged again. The default redirect cap is 1; `JEV_NO_BULLSHIT_MAX_REDIRECTS` can change it.
+The unverified threshold is 0.65; weasel, rhetoric and palter use 0.7. The bar is the same on every attempt. Each sentence or action is called out at most `JEV_NO_BULLSHIT_MAX_CALLOUTS` times per turn (default 1), identified by the sentence's text or the action's tool, input and result, since indices shift between attempts. Without this, a revision that named a failure and then answered a later note without repeating it had the same failure flagged again. The default redirect cap is 1; `JEV_NO_BULLSHIT_MAX_REDIRECTS` can change it.
 
 Historically, a single unverified question used 0.73, then 0.5, then 0.6. A false claim about the loaded plugin version scored 0.54 and passed the 0.6 check, while 0.5 caused false flags. The current three-part unverified decision uses 0.65; its scores are not directly comparable with those old scores. [The score analysis](statistical-decision.md) records the current evidence and limits.
 
