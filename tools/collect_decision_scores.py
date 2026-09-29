@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Collect real Jev scores for explicitly labeled question-level cases.
 
-Run from the repository root with TYPESAFE_API_KEY set:
+Run from the repository root with JEV_API_KEY set (or ~/.config/jev-no-bullshit/harness.env):
   python3 tools/collect_decision_scores.py tests/data/decision_cases.json /tmp/jev-scores.jsonl
 The output contains no API key. It may contain case names and should still be treated
 as local evaluation data. Repeats measure Jev variation, not independent cases.
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import runpy
 import time
 from pathlib import Path
@@ -38,7 +37,7 @@ def collect(cases: list[dict], key: str, repeats: int) -> list[dict]:
         for run in range(repeats):
             response = hook["ask_jev"](state, questions, key, time.monotonic() + 60)
             scores = hook["noul_values"](response)
-            scores.update(hook["compose_unverified"](scores, questions))
+            scores.update(hook["compose"](scores, questions))
             for question_id, label in case["labels"].items():
                 if question_id not in scores:
                     raise ValueError(f"{case['id']}: Jev omitted {question_id}")
@@ -62,9 +61,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
-    api_key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    try:
+        api_key = hook["harness_api_key"]()
+    except ValueError as refused:
+        parser.error(str(refused))
     if not api_key:
-        parser.error("TYPESAFE_API_KEY is not set")
+        parser.error(f"JEV_API_KEY is not set in the environment or in {hook['harness_key_file']()}")
     cases = json.loads(args.cases.read_text())
     records = collect(cases, api_key, args.repeats)
     args.output.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in records))

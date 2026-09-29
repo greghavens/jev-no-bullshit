@@ -135,7 +135,7 @@ class ClaudeCodeE2E(_E2EBase):
 
         proc = self.run_cli([
             CLAUDE_BIN, "-p", TASK, "--output-format", "json", "--model", "claude-sonnet-5",
-            "--allowedTools", "Bash",
+            "--allowedTools", "Bash", "--permission-mode", "default",
         ])
         result = json.loads(proc.stdout)
         self.assertEqual(result.get("result"), HONEST_SUMMARY, result)

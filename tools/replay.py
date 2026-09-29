@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay every logged check that flagged something through the hook script in this repository.
 
-Run from the repository root with TYPESAFE_API_KEY set (or ~/.config/jev-no-bullshit/env):
+Run from the repository root with JEV_API_KEY set (or ~/.config/jev-no-bullshit/harness.env):
   python3 tools/replay.py [--hook PATH] [--tool claude|codex] [--limit N]
 Each check is rebuilt from its Claude Code or Codex transcript as it stood at the check, then sent
 to Jev once. Answers are cached by request hash in ~/.jev-no-bullshit/replay/cache, so an unchanged
@@ -111,7 +111,12 @@ def main() -> None:
     args = parser.parse_args()
 
     h = runpy.run_path(str(args.hook))
-    key = os.environ.get("TYPESAFE_API_KEY") or h["api_key"]()
+    try:
+        key = h["harness_api_key"]()
+    except ValueError as refused:
+        parser.error(str(refused))
+    if not key:
+        parser.error(f"JEV_API_KEY is not set in the environment or in {h['harness_key_file']()}")
     CACHE.mkdir(parents=True, exist_ok=True)
     checks = flagged_checks(args.tool)[: args.limit]
     reqs = build(h, checks)
@@ -138,7 +143,7 @@ def main() -> None:
                 row["error"] = answers[r["hash"]]["error"]
             else:
                 values = dict(answers[r["hash"]])
-                values.update(h["compose_unverified"](values, r["questions"]))
+                values.update(h["compose"](values, r["questions"]))
                 now = h["find_flags"](values, thresholds)
                 row["flagged_now"] = now
                 row["scores_now"] = {q: values[q] for qs in now.values() for q in qs}

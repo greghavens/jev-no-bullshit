@@ -1,6 +1,6 @@
 """Live tests: the real TypeSafe API, no stand-in for Jev.
 
-These run only when TYPESAFE_API_KEY is set, and they spend real API calls. They check what the local
+These run only with the harness's own key (JEV_API_KEY, or ~/.config/jev-no-bullshit/harness.env), and they spend real API calls. They check what the local
 stand-in can't: that api.typesafe.ai accepts the hook's request, answers every question, answers within
 the hook's 10 second limit, and that Jev's judgments make the hook do the right thing on clear cases.
 
@@ -28,17 +28,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_e2e  # noqa: E402
 from mocks import BULLSHIT_SUMMARY, HONEST_SUMMARY  # noqa: E402
-from test_hook import SCRIPT, claude_transcript  # noqa: E402
+from test_hook import SCRIPT, claude_transcript, hook  # noqa: E402
 
-API_KEY = os.environ.get("TYPESAFE_API_KEY", "").strip()
-SKIP = "TYPESAFE_API_KEY is not set; live tests call the real TypeSafe API"
-QUESTION_TYPES = ("unverified_action", "unverified_contradiction", "unverified_missing_check",
-                  "weasel", "rhetoric", "palter")
+API_KEY = hook.harness_api_key()
+SKIP = "JEV_API_KEY is not set; live tests call the real TypeSafe API"
+# Only CI, which has no key, may skip these. Anywhere else a missing key is a failure: a Jev test
+# that quietly skips has tested nothing.
+if not API_KEY and not os.environ.get("CI"):
+    raise RuntimeError(f"JEV_API_KEY is not set in the environment or in {hook.harness_key_file()}")
+SENTENCE_QUESTIONS = ("unverified_action", "unverified_contradiction", "unverified_missing_check",
+                      "unverified_change", "unverified_narrow",
+                      "weasel_outcome", "weasel_vague", "rhetoric")
 
 
 def live_env(home: Path) -> dict:
     """The real environment (key, proxy, CA bundle) with a throwaway HOME and no TypeSafe URL override."""
     env = {k: v for k, v in os.environ.items() if k != "TYPESAFE_BASE_URL"}
+    env["TYPESAFE_API_KEY"] = API_KEY  # the harness's key, never the plugin's
     env["HOME"] = str(home)
     env["JEV_NO_BULLSHIT_MODULE"] = "1"  # the script runs as Claude Code's hooks module runs it
     return env
@@ -95,7 +101,7 @@ class HookLiveTests(LiveChecks, unittest.TestCase):
 
     @staticmethod
     def question_ids(sentences, actions=2):
-        return [f"{t}_s{i}" for i in range(sentences) for t in QUESTION_TYPES[:5]] + [f"palter_a{j}" for j in range(actions)]
+        return [f"{t}_s{i}" for i in range(sentences) for t in SENTENCE_QUESTIONS] + [f"palter_a{j}" for j in range(actions)]
 
     def test_spec_example_is_redirected(self):
         # Actions: Edit src/auth.ts -> ok; Bash npm test -> "2 failed, 41 passed" (error).
@@ -187,7 +193,7 @@ class _CLILive(LiveChecks):
         self.assertEqual(len(log), 2, "\n".join(show(c) for c in log))
         first, second = log
         # One sentence, one action (the failing command).
-        self.assert_real_answer(first, [f"{t}_s0" for t in QUESTION_TYPES[:5]] + ["palter_a0"])
+        self.assert_real_answer(first, [f"{t}_s0" for t in SENTENCE_QUESTIONS] + ["palter_a0"])
         self.assertEqual(first["tool"], tool)
         self.assertEqual(first["summary"], BULLSHIT_SUMMARY)
         self.assertEqual(first["missing_tool_results"], 0)

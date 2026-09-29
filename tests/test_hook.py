@@ -149,10 +149,29 @@ class ThresholdTests(unittest.TestCase):
 
     def test_unverified_components_are_one_decision_and_require_all_answers(self):
         questions = {f"{part}_s0": hook.make_question(part, 0) for part in hook.UNVERIFIED_PARTS}
-        scores = {f"{part}_s0": score for part, score in zip(hook.UNVERIFIED_PARTS, (0.12, 0.91, 0.33))}
-        self.assertEqual(hook.compose_unverified(scores, questions), {"unverified_s0": 0.91})
+        scores = {f"{part}_s0": score for part, score in zip(hook.UNVERIFIED_PARTS, (0.12, 0.91, 0.33, 0.98, 0.2))}
+        self.assertEqual(hook.compose(scores, questions), {"unverified_s0": 0.91})
         del scores[f"{hook.UNVERIFIED_ACTION}_s0"]
-        self.assertEqual(hook.compose_unverified(scores, questions), {})
+        self.assertEqual(hook.compose(scores, questions), {})
+
+    def test_a_claimed_change_counts_only_when_its_evidence_is_a_stand_in(self):
+        # "So Jev no longer flags ..." answered change 0.98 and narrow 0.70; "all 19 passed" 0.26 and 0.64.
+        questions = {f"{part}_s0": hook.make_question(part, 0) for part in hook.UNVERIFIED_PARTS}
+        scores = {f"{part}_s0": 0.1 for part in hook.UNVERIFIED_PARTS}
+        scores.update({f"{hook.UNVERIFIED_CHANGE}_s0": 0.98, f"{hook.UNVERIFIED_NARROW}_s0": 0.7})
+        self.assertEqual(hook.compose(scores, questions), {"unverified_s0": 0.7})
+        scores.update({f"{hook.UNVERIFIED_CHANGE}_s0": 0.26, f"{hook.UNVERIFIED_NARROW}_s0": 0.64})
+        self.assertEqual(hook.compose(scores, questions), {"unverified_s0": 0.26})
+
+    def test_weasel_needs_both_an_outcome_and_a_vague_qualifier(self):
+        # "I also need to correct something I said before" answered 0.14 and 0.42: not about the outcome.
+        questions = {f"{part}_s0": hook.make_question(part, 0) for part in hook.WEASEL_PARTS}
+        scores = {f"{hook.WEASEL_OUTCOME}_s0": 0.14, f"{hook.WEASEL_VAGUE}_s0": 0.95}
+        self.assertEqual(hook.compose(scores, questions), {"weasel_s0": 0.14})
+        scores[f"{hook.WEASEL_OUTCOME}_s0"] = 0.97
+        self.assertEqual(hook.compose(scores, questions), {"weasel_s0": 0.95})
+        del scores[f"{hook.WEASEL_VAGUE}_s0"]
+        self.assertEqual(hook.compose(scores, questions), {})
 
 
 class TranscriptTests(unittest.TestCase):
@@ -536,7 +555,7 @@ class SizeTests(unittest.TestCase):
         actions = [hook.make_action("Bash", f"cmd {i}", "ok", False) for i in range(10)]
         state, _ = hook.build_state("task", actions, "One. Two.", hook.state_token_budget())
         full, palters, sentences = hook.build_questions(state)
-        self.assertEqual((len(full), palters, sentences), (20, 0, 0))
+        self.assertEqual((len(full), palters, sentences), (26, 0, 0))
         need = hook.REQUEST_OVERHEAD_TOKENS + hook.estimate_tokens(state) + sum(map(hook.question_tokens, full.values()))
         palter_cost = hook.question_tokens(full["palter_a0"])
         with mock.patch.object(hook, "REQUEST_TOKEN_LIMIT", (need - palter_cost) * hook.ESTIMATE_MARGIN):
@@ -614,7 +633,7 @@ class HookRunTests(unittest.TestCase):
         self.assertEqual(body["state"]["sentences"], ["Fixed the login bug.", "All tests are passing and the flow is solid."])
         self.assertEqual(
             sorted(body["questions"]),
-            sorted([f"{t}_s{i}" for i in range(2) for t in (*hook.UNVERIFIED_PARTS, "weasel", "rhetoric")]
+            sorted([f"{t}_s{i}" for i in range(2) for t in hook.SENTENCE_QUESTIONS]
                    + ["palter_a0", "palter_a1"]),
         )
         self.assertEqual(body["questions"]["unverified_action_s1"], hook.make_question("unverified_action", 1))
@@ -786,9 +805,19 @@ class HookRunTests(unittest.TestCase):
         del self.env["TYPESAFE_API_KEY"]
         key_file = self.home / ".config" / "jev-no-bullshit" / "env"
         key_file.parent.mkdir(parents=True)
-        key_file.write_text("# key\nexport TYPESAFE_API_KEY=\"file-key\"\n")
+        key_file.write_text("# key\nTYPESAFE_API_KEY=\"file-key\"\n")
         self.assertIsNone(self.run_hook())
         self.assertEqual(self.jev.requests[0]["headers"]["Authorization"], "Bearer file-key")
+
+    def test_refuses_a_config_file_that_exports_the_key(self):
+        # Sourced from a shell profile, an export line puts the key in every process's environment.
+        del self.env["TYPESAFE_API_KEY"]
+        key_file = self.home / ".config" / "jev-no-bullshit" / "env"
+        key_file.parent.mkdir(parents=True)
+        key_file.write_text("export TYPESAFE_API_KEY=file-key\n")
+        output = self.run_hook()
+        self.assertIn("exports TYPESAFE_API_KEY", output["systemMessage"])
+        self.assertEqual(self.jev.calls, [])
 
     def test_environment_key_wins_over_config_file(self):
         key_file = self.home / ".config" / "jev-no-bullshit" / "env"
@@ -796,6 +825,24 @@ class HookRunTests(unittest.TestCase):
         key_file.write_text("TYPESAFE_API_KEY=file-key\n")
         self.assertIsNone(self.run_hook())
         self.assertEqual(self.jev.requests[0]["headers"]["Authorization"], "Bearer test-key")
+
+    def test_harness_key_is_separate_from_the_plugin_key(self):
+        # The replay tools and live tests must never spend the plugin's key, and the plugin must never
+        # spend the harness's.
+        with tempfile.TemporaryDirectory() as config:
+            folder = Path(config) / "jev-no-bullshit"
+            folder.mkdir()
+            env = {"XDG_CONFIG_HOME": config, "TYPESAFE_API_KEY": "plugin-key"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(hook.harness_api_key(), "")
+                (folder / "env").write_text("JEV_API_KEY=wrong-file\n")
+                self.assertEqual(hook.harness_api_key(), "")
+                (folder / "harness.env").write_text("JEV_API_KEY='harness-file'\n")
+                self.assertEqual(hook.harness_api_key(), "harness-file")
+                self.assertEqual(hook.api_key(), "plugin-key")
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config, "JEV_API_KEY": "harness-env"}, clear=True):
+                self.assertEqual(hook.harness_api_key(), "harness-env")
+                self.assertEqual(hook.api_key(), "")
 
     def test_fails_open_on_http_error(self):
         self.jev.status = 500

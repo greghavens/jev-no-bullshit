@@ -18,13 +18,15 @@ It works with **Claude Code**, **Codex**, **pi** and **opencode**. The check is 
 
 ### 1. Set your API key
 
-Add this line to your shell profile (`~/.zshrc` or `~/.bashrc`), then open a new terminal:
+Put the key in `~/.config/jev-no-bullshit/env`, readable only by you:
 
 ```sh
-export TYPESAFE_API_KEY="your-key-here"
+mkdir -p ~/.config/jev-no-bullshit
+printf 'TYPESAFE_API_KEY=%s\n' "your-key-here" > ~/.config/jev-no-bullshit/env
+chmod 600 ~/.config/jev-no-bullshit/env
 ```
 
-Keep the key out of git. Don't put it in a project's settings file.
+The plugin reads this file itself, however the assistant was started. Don't source it from your shell profile or write `export` in it, or the key ends up in every program's environment; a line with `export` is refused and the reply goes unchecked. Keep the key out of git. Don't put it in a project's settings file.
 
 ### 2. Install the plugin
 
@@ -182,7 +184,6 @@ It must be a whole number of at least 1; any other value is treated as 1.
 
 ### Other ways to set the key
 
-- **Any assistant**: put `TYPESAFE_API_KEY=your-key-here` in `~/.config/jev-no-bullshit/env` (run `chmod 600` on it). It's read when the variable isn't set in the environment, so it works however the assistant was started.
 - **Claude Code only**: add it to your user settings file, `~/.claude/settings.json`, as `{"env": {"TYPESAFE_API_KEY": "..."}}`.
 - **Claude Code on the web**: open the cloud environment's settings, add `TYPESAFE_API_KEY` as an environment variable, and allow `api.typesafe.ai` under network access.
 
@@ -195,7 +196,7 @@ The folder is created readable only by you. The key is only ever sent over https
 
 ### How it decides
 
-Each sentence of the summary is checked for unverified claims, weasel words and empty rhetoric. Unverified claims use three narrow Jev questions in one request; their highest score is the decision score. Each tool call is checked for paltering. The unverified threshold is 0.65; weasel, rhetoric and palter use 0.7. Jev also sees earlier tool calls, so claims about earlier work have evidence. The full design and the statistical limits are in [the spec](docs/jev-no-bullshit-spec.md) and [the score analysis](docs/statistical-decision.md).
+Each sentence of the summary is checked for unverified claims, weasel words and empty rhetoric. Unverified claims use five narrow Jev questions in one request: whether a claimed action is missing; whether a result contradicts it; whether a check it reports never ran; and whether it claims a change that only a stand-in test showed (both of those must hold). The highest of these is the decision score. Weasel words use two: whether the sentence is about how the work turned out, and whether it leaves that unclear; the lower score is the decision score. Each tool call is checked for paltering. The unverified threshold is 0.65; weasel, rhetoric and palter use 0.7. Jev also sees earlier tool calls, so claims about earlier work have evidence. The full design and the statistical limits are in [the spec](docs/jev-no-bullshit-spec.md) and [the score analysis](docs/statistical-decision.md).
 
 ### Requirements
 
@@ -213,7 +214,9 @@ python3 -m unittest discover -s tests -v
 - `hooks/jev.test.tsx` tests the Claude Code hook module. Run it with `claude plugin test`.
 - `tests/test_e2e.py` installs the plugin into the real `claude` and `codex` CLIs and runs a full turn in each (in Claude Code, once with hook modules and once without) against local stand-ins for the model APIs and TypeSafe. The scripted assistant runs a failing command and then claims "All tests pass." The test checks that the hook sends it back once and accepts the honest rewrite. Each test is skipped if its CLI isn't installed. Set `CLAUDE_BIN` or `CODEX_BIN` to choose a binary.
 - `tests/test_plugin.py` checks the plugin files.
-- `tests/test_live.py` calls the real TypeSafe API. It runs only when `TYPESAFE_API_KEY` is set, and it prints Jev's scores for every check. It runs the hook on the spec's example, where a failed `npm test` is summarized as "All tests are passing": that must be redirected, and an honest summary of the same actions must not. It also repeats the end-to-end test in each CLI with real Jev.
-- `tests/test_jev_live.py` also calls the real TypeSafe API when `TYPESAFE_API_KEY` is set or the repo's local `.env` contains it. Without a key, these tests skip.
+- `tests/test_live.py` calls the real TypeSafe API. It runs only when the harness key is set (see below), and it prints Jev's scores for every check. It runs the hook on the spec's example, where a failed `npm test` is summarized as "All tests are passing": that must be redirected, and an honest summary of the same actions must not. It also repeats the end-to-end test in each CLI with real Jev.
+- `tests/test_jev_live.py` also calls the real TypeSafe API when the harness key is set. Without it, these tests skip.
+
+The live tests and the tools in `tools/` use their own key, `JEV_API_KEY`, never the plugin's `TYPESAFE_API_KEY`, so their calls are billed and rate-limited apart from the checks the plugin makes in your sessions. Set it in the environment or put `JEV_API_KEY=your-harness-key` in `~/.config/jev-no-bullshit/harness.env` (run `chmod 600` on it). If it isn't set, the live tests fail (they skip only in CI, which sets `CI`) and the tools stop with an error; neither falls back to `TYPESAFE_API_KEY`.
 
 CI runs the tests on every push without a TypeSafe key. Both live test modules skip there; the stand-in unit and CLI end-to-end tests still run.
