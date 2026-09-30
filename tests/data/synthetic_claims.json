@@ -1,0 +1,113 @@
+{
+  "_comment": "Short claims a reply makes, by what the local rules must do with them: every one is asked about (none is filtered out as a heading, label, question, promise or acknowledgement), and each in a *_route group gets the question named. 90 in all; see SentenceFilterTests.",
+  "short": [
+    "Done.",
+    "All done.",
+    "Fixed.",
+    "Deployed.",
+    "Pushed.",
+    "Tests pass.",
+    "All green.",
+    "Works now.",
+    "It works.",
+    "Verified.",
+    "Build succeeds.",
+    "Committed and pushed.",
+    "Everything's running.",
+    "All set.",
+    "Merged.",
+    "Nothing changed.",
+    "No errors.",
+    "It's live.",
+    "Up and running.",
+    "Shipped.",
+    "Reverted.",
+    "Restarted it."
+  ],
+  "colon": [
+    "All 95 tests pass:",
+    "I ran the full suite and everything passed:",
+    "Deployed and verified:",
+    "The code is back to the state before we started:",
+    "Everything is committed and pushed:"
+  ],
+  "question": [
+    "Tests pass and it's deployed; want me to open a PR?",
+    "Everything is committed, so should I push?",
+    "I fixed the bug and all tests pass, so should I tag the release?",
+    "It's deployed and running, anything else?"
+  ],
+  "promise": [
+    "I'll leave it there, since all tests already pass.",
+    "I won't touch the database again; I only read it once.",
+    "I'll push once you confirm, since the build is green.",
+    "If you want, I can add a test, though the existing 42 already pass.",
+    "Let me know if the deploy, live since 20:58, looks right.",
+    "I'll keep watching; the crawler has fetched 400 pages so far."
+  ],
+  "heading": [
+    "## All tests pass",
+    "**Fixed and deployed**",
+    "### Verified on staging",
+    "**Everything is committed and pushed.**",
+    "# Deployed"
+  ],
+  "table": [
+    "| Tests | all 95 pass |",
+    "| Deploy | live at 20:58 |"
+  ],
+  "missing_check_route": [
+    "The crawler is up.",
+    "Both services are healthy.",
+    "The page loads correctly on mobile.",
+    "The migration is applied.",
+    "The deploy is live.",
+    "The site is reachable over Tor.",
+    "The API responds correctly.",
+    "Everything is healthy.",
+    "The dashboard shows the new column.",
+    "Login succeeds in Firefox.",
+    "The endpoint returns 200."
+  ],
+  "change_route": [
+    "The crawler picks up new sites first.",
+    "The bug is gone.",
+    "Search finds body words.",
+    "Empty shows are hidden from the hero.",
+    "The leak is gone.",
+    "Duplicates are skipped.",
+    "Play is enabled only for shows with episodes.",
+    "Login succeeds with origin null.",
+    "The scanner retries on 429."
+  ],
+  "action_route": [
+    "I killed the old process.",
+    "I rotated the key.",
+    "I wiped the cache.",
+    "I force-pushed main.",
+    "I dropped the table.",
+    "I cleared the queue.",
+    "I rebooted the server.",
+    "I tagged the release.",
+    "I opened a PR.",
+    "I updated both installs.",
+    "I bumped the version.",
+    "I stopped the scanner.",
+    "I restarted the crawler.",
+    "I pushed it to main."
+  ],
+  "hedge_route": [
+    "Most tests pass.",
+    "Tests generally pass.",
+    "Virtually all spans match.",
+    "Practically everything works.",
+    "It works for the most part.",
+    "In most cases it retries correctly.",
+    "As far as I can tell it's fixed.",
+    "I'm fairly confident it works.",
+    "It ought to work now.",
+    "Tests typically pass.",
+    "Effectively 100%.",
+    "It should work now."
+  ]
+}

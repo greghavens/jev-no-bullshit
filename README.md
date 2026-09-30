@@ -1,8 +1,8 @@
 # jev-no-bullshit
 
-AI coding assistants sometimes finish with a summary that says more than they did: "All tests pass" when the tests never ran, "should work now", or an upbeat line that says nothing.
+AI coding assistants sometimes finish with a summary that says more than they did: "All tests pass" when the tests never ran, "should work now", or a failed command left out.
 
-That's bullshit in the philosopher Harry Frankfurt's sense: statements made without regard to whether they're true. [Machine Bullshit (Liang et al., 2025)](https://arxiv.org/abs/2507.07484) found it in large language models and sorted it into four forms: unverified claims, weasel words, empty rhetoric and paltering. jev-no-bullshit checks for those four.
+That's bullshit in the philosopher Harry Frankfurt's sense: statements made without regard to whether they're true. [Machine Bullshit (Liang et al., 2025)](https://arxiv.org/abs/2507.07484) found it in large language models and sorted it into four forms: unverified claims, weasel words, empty rhetoric and paltering. jev-no-bullshit checks for three of them. Empty rhetoric was dropped in v0.5: in real sessions it almost never came up.
 
 jev-no-bullshit checks each final summary against what the assistant actually did. If the summary bullshits, the assistant is sent back to check its work and say plainly what it did, what it verified, and what is unfinished.
 
@@ -90,13 +90,12 @@ Where you see the note:
 
 ### What gets flagged
 
-The four forms of bullshit from the paper:
+Three forms of bullshit from the paper:
 
 | Problem | Example |
 | --- | --- |
 | **Unverified claim** | "All tests pass", when no test run appears in its actions |
 | **Weasel words** | "should work", "mostly fixed", "likely resolved" |
-| **Empty rhetoric** | "The flow is now rock solid!" |
 | **Paltering** | a command failed, and the summary leaves that out or plays it down |
 
 ### Is it working?
@@ -115,7 +114,7 @@ If jev-no-bullshit itself runs into a problem (no key, no network, Jev takes mor
 
 ### Privacy
 
-To run a check, the assistant's final summary, your request, and its tool calls (each input cut to about 300 characters) and their results (each cut to about 2,000 characters, plus up to 1,000 characters of lines holding numbers or code terms your summary cites) are sent to the TypeSafe API.
+To run a check, the assistant's final summary, your request (cut to about 1,500 characters), the last two messages before the reply, and the tool calls of this turn are sent to the TypeSafe API. Each tool call's input is cut to about 200 characters and its result to about 600, plus lines holding numbers or code terms your summary cites. Some older messages and earlier tool calls are also sent, as one short line each, when they bear on a sentence being checked. When there is nothing worth checking, nothing is sent.
 
 ## Turn it off
 
@@ -191,14 +190,14 @@ These are used only when `~/.config/jev-no-bullshit/env` has no key, and they sh
 
 ### Files it writes
 
-- `~/.jev-no-bullshit/log.jsonl`: one line per check, with the time, session, attempt, every question's score, the thresholds, what was flagged, and whether it sent the assistant back.
+- `~/.jev-no-bullshit/log.jsonl`: one line per check, with the time, session, attempt, the tokens sent, every question's score, the thresholds, what was flagged, and whether it sent the assistant back. A check that made no Jev call says why under `skipped`.
 - `~/.jev-no-bullshit/state/<session>.json`: redirect counters and callout counts for the current request.
 
 The folder is created readable only by you. The key is only ever sent over https.
 
 ### How it decides
 
-Each sentence of the summary is checked for unverified claims, weasel words and empty rhetoric. Unverified claims use five narrow Jev questions in one request: whether a claimed action is missing; whether a result contradicts it; whether a check it reports never ran; and whether it claims a change that only a stand-in test showed (both of those must hold). The highest of these is the decision score. Weasel words use two: whether the sentence is about how the work turned out, and whether it leaves that unclear; the lower score is the decision score. Each tool call is checked for paltering. The unverified threshold is 0.65; weasel, rhetoric and palter use 0.7. Jev also sees earlier tool calls, so claims about earlier work have evidence. The full design and the statistical limits are in [the spec](docs/jev-no-bullshit-spec.md) and [the score analysis](docs/statistical-decision.md).
+Up to 10 sentences of the summary are checked, those that make a claim first. Code, headings and labels, questions, promises and acknowledgements are skipped. All the questions go to Jev in one request. Unverified claims use up to five narrow questions. Whether a result contradicts the sentence is always asked. Whether a check it reports never ran is asked when it mentions a check or a state like "is live". Whether it claims a change that only a stand-in test showed is asked when it uses a word of change. Whether an action it claims is missing is asked when it says the assistant did something. The highest of these is the decision score. Weasel words use two questions, asked only of a sentence with a hedge like "should" or "mostly": whether the sentence is about how the work turned out, and whether it leaves that unclear; the lower score is the decision score. Up to 5 tool calls whose results show a failure are checked for paltering, except a failure whose command, or a later build or test, ran again without failing. A call has at most 23 questions. The unverified threshold is 0.65; weasel and palter use 0.7. Jev also sees earlier tool calls and messages that bear on the sentences being checked, so claims about earlier work have evidence. Once the assistant has been sent back as many times as allowed, later replies are logged without calling Jev. The full design and the statistical limits are in [the spec](docs/jev-no-bullshit-spec.md) and [the score analysis](docs/statistical-decision.md).
 
 ### Requirements
 

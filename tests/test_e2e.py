@@ -64,6 +64,8 @@ class _E2EBase(unittest.TestCase):
         }
         if not getattr(self, "live_api_key", None):
             self.env["TYPESAFE_BASE_URL"] = self.jev.url
+        # A subclass's settings for the hook, known before a CLI's server is spawned.
+        self.env.update(getattr(self, "hook_env", {}))
 
     def tearDown(self):
         self.jev.close()
@@ -93,20 +95,22 @@ class _E2EBase(unittest.TestCase):
         self.assertTrue(first["redirected"])
         self.assertEqual(second["attempt"], 1)
         self.assertEqual(second["summary"], HONEST_SUMMARY)
-        self.assertFalse(second["redirected"])
+        # One redirect by default: the rewrite is logged, not sent to Jev, since a flag could not be sent back.
+        self.assertEqual(second["skipped"], "redirects used up", second)
+        self.assertNotIn("redirected", second)
+        self.assertEqual(len(self.jev.calls), 1, self.jev.calls)
 
         # What Jev saw on the first check, built from the CLI's real transcript.
         state = self.jev.calls[0]["body"]["state"]
         self.assertEqual(state["task"], TASK)
         self.assertEqual(state["sentences"], [BULLSHIT_SUMMARY])
         self.assertEqual(len(state["actions"]), 1, state["actions"])
+        # Each action goes as one string: "tool (error): input\n=> result".
         action = state["actions"][0]
-        self.assertEqual(action["tool"], tool_name)
-        self.assertIn("exit 3", action["input"])
-        self.assertIn("running tests", action["result"])
-        self.assertTrue(action["error"], action)
-        # The revision is checked against the same task and actions.
-        self.assertEqual(self.jev.calls[1]["body"]["state"]["task"], TASK)
+        self.assertTrue(action.startswith(f"{tool_name} (error): "), action)
+        command, result = action.split("\n=>", 1)
+        self.assertIn("exit 3", command)
+        self.assertIn("running tests", result)
         self.assertEqual(self.jev.schema_errors, [])
 
 
@@ -304,7 +308,7 @@ class OpencodeE2E(_E2EBase):
         self.assert_one_redirect("opencode", "bash")
         # The shell tool reports a failed command as completed; the plugin adds its exit code.
         if self.jev.calls:
-            self.assertIn("Exit code: 3", self.jev.calls[0]["body"]["state"]["actions"][0]["result"])
+            self.assertIn("Exit code: 3", self.jev.calls[0]["body"]["state"]["actions"][0].split("\n=>", 1)[1])
         else:  # the real-API subclass has no stand-in request to inspect
             self.assertIn("palter_a0", self.hook_log()[0]["flagged"].get("palter", []))
 

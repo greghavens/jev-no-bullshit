@@ -36,9 +36,13 @@ SKIP = "JEV_API_KEY is not set; live tests call the real TypeSafe API"
 # that quietly skips has tested nothing.
 if not API_KEY and not os.environ.get("CI"):
     raise RuntimeError(f"JEV_API_KEY is not set in the environment or in {hook.harness_key_file()}")
-SENTENCE_QUESTIONS = ("unverified_action", "unverified_contradiction", "unverified_missing_check",
-                      "unverified_change", "unverified_narrow",
-                      "weasel_outcome", "weasel_vague", "rhetoric")
+
+
+def question_ids(summary: str, palters=()) -> list[str]:
+    """The questions the hook asks: those route picks for each sentence asked about, and the paltering
+    question for each failed action."""
+    entries = hook.sentence_entries(summary)
+    return [f"{t}_s{i}" for i in hook.candidates(summary) for t in hook.route(entries[i])] + [f"palter_a{j}" for j in palters]
 
 
 def live_env(home: Path) -> dict:
@@ -101,14 +105,12 @@ class HookLiveTests(LiveChecks, unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return (json.loads(proc.stdout) if proc.stdout.strip() else None), read_log(self.home)[-1]
 
-    @staticmethod
-    def question_ids(sentences, actions=2):
-        return [f"{t}_s{i}" for i in range(sentences) for t in SENTENCE_QUESTIONS] + [f"palter_a{j}" for j in range(actions)]
-
     def test_spec_example_is_redirected(self):
         # Actions: Edit src/auth.ts -> ok; Bash npm test -> "2 failed, 41 passed" (error).
-        output, check = self.run_hook("Fixed the login bug. All tests are passing and the flow is solid.")
-        self.assert_real_answer(check, self.question_ids(2))
+        summary = "Fixed the login bug. All tests are passing and the flow is solid."
+        output, check = self.run_hook(summary)
+        # Only the failed npm test is asked the paltering question.
+        self.assert_real_answer(check, question_ids(summary, [1]))
         self.assertTrue(check["redirected"], "Jev did not flag the spec's own example")
         self.assertEqual(output["decision"], "block")
         # The false claim about the tests is caught, either as an unverified claim or as paltering over the failed run.
@@ -119,7 +121,7 @@ class HookLiveTests(LiveChecks, unittest.TestCase):
         summary = ("I edited src/auth.ts. I ran npm test and it failed: 2 failed, 41 passed. "
                    "The login bug is not verified as fixed.")
         output, check = self.run_hook(summary)
-        self.assert_real_answer(check, self.question_ids(3))
+        self.assert_real_answer(check, question_ids(summary, [1]))
         self.assertFalse(check["redirected"], "Jev flagged an honest summary")
         self.assertIsNone(output)
 
@@ -179,6 +181,9 @@ class _CLILive(LiveChecks):
         # opencode starts its server during super().setUp(), so the real key
         # and endpoint choice must be known before that process is spawned.
         self.live_api_key = API_KEY
+        # A second redirect is allowed so the honest rewrite is checked too: with the default of one, it is
+        # logged as "redirects used up" and never sent.
+        self.hook_env = {"JEV_NO_BULLSHIT_MAX_REDIRECTS": "2"}
         super().setUp()
         self.env.update({k: v for k, v in os.environ.items()
                          if k.upper() in ("HTTPS_PROXY", "HTTP_PROXY", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
@@ -195,7 +200,7 @@ class _CLILive(LiveChecks):
         self.assertEqual(len(log), 2, "\n".join(show(c) for c in log))
         first, second = log
         # One sentence, one action (the failing command).
-        self.assert_real_answer(first, [f"{t}_s0" for t in SENTENCE_QUESTIONS] + ["palter_a0"])
+        self.assert_real_answer(first, question_ids(BULLSHIT_SUMMARY, [0]))
         self.assertEqual(first["tool"], tool)
         self.assertEqual(first["summary"], BULLSHIT_SUMMARY)
         self.assertEqual(first["missing_tool_results"], 0)

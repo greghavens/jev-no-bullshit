@@ -36,10 +36,10 @@ class LiveJev(unittest.TestCase):
     def flagged(self, summary: str, qtype: str = hook.UNVERIFIED, task: str = "Push it and check the install",
                 actions: list = ACTIONS) -> list[str]:
         """The sentences flagged as `qtype`, from one Jev call as the hook makes it."""
-        state, _ = hook.build_state(task, actions, summary, hook.state_token_budget())
-        questions, _, _ = hook.build_questions(state)
+        state, _ = hook.build_state(task, actions, summary)
+        questions, _, _ = hook.build_questions(state, summary)
         thresholds = {t: hook.threshold(t) for t in hook.TYPES}
-        values = hook.noul_values(hook.ask_jev(state, questions, self.key, time.monotonic() + 60))
+        values = hook.noul_values(hook.ask_jev(hook.wire_state(state), questions, self.key, time.monotonic() + 60))
         values.update(hook.compose(values, questions))
         written = [s for _, s in hook.sentences_with_headings(summary)]
         return [written[int(q.rsplit("_s", 1)[1])] for q in hook.find_flags(values, thresholds).get(qtype, [])]

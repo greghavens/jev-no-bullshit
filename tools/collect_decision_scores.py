@@ -23,19 +23,19 @@ def collect(cases: list[dict], key: str, repeats: int) -> list[dict]:
     records = []
     for case in cases:
         state, _ = hook["build_state"](
-            case["task"], case["actions"], case["summary"], hook["state_token_budget"](),
-            case.get("earlier_actions", []), case.get("conversation", []),
+            case["task"], case["actions"], case["summary"], case.get("earlier_actions", []), case.get("conversation", []),
         )
-        questions, _, _ = hook["build_questions"](state)
-        composed_ids = {qid.replace("unverified_action_", "unverified_", 1)
-                        for qid in questions if qid.startswith("unverified_action_s")}
+        questions, _, _ = hook["build_questions"](state, case["summary"])
+        # A composed decision (unverified_s0, weasel_s0) exists when any of its parts was asked (route).
+        composed_ids = {f"{hook['PART_OF'][qid.rsplit('_', 1)[0]]}_{qid.rsplit('_', 1)[1]}"
+                        for qid in questions if qid.rsplit("_", 1)[0] in hook["PART_OF"]}
         unknown = set(case["labels"]) - (set(questions) | composed_ids)
         if unknown:
             raise ValueError(f"{case['id']}: labels name missing questions: {sorted(unknown)}")
         if not case["labels"]:
             raise ValueError(f"{case['id']}: no labels")
         for run in range(repeats):
-            response = hook["ask_jev"](state, questions, key, time.monotonic() + 60)
+            response = hook["ask_jev"](hook["wire_state"](state), questions, key, time.monotonic() + 60)
             scores = hook["noul_values"](response)
             scores.update(hook["compose"](scores, questions))
             for question_id, label in case["labels"].items():

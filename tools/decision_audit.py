@@ -17,7 +17,7 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
-DEFAULT_THRESHOLDS = {"unverified": 0.65, "weasel": 0.7, "rhetoric": 0.7, "palter": 0.7}
+DEFAULT_THRESHOLDS = {"unverified": 0.65, "weasel": 0.7, "palter": 0.7}
 
 
 def upper_binomial_rate(errors: int, count: int, confidence: float = 0.95) -> float | None:
