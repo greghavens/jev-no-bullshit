@@ -1148,6 +1148,32 @@ def did_line(action: dict, sentence: str) -> str:
     return head + " | ".join(lines[k][:LEAD_LINE_CHARS] for k in sorted(picked))
 
 
+# A sentence saying tests pass, and a test runner's summary line (unittest, pytest, cargo, jest, TAP).
+_TESTS_PASS_RE = re.compile(r"(?i)\b(?:tests?|suites?)\b[^.;:]{0,40}?\b(?:pass(?:es|ed)?|green|succeed\w*)\b")
+_TEST_SUMMARY_RE = re.compile(
+    r"(?m)^\s*(?:Ran \d+ tests?\b.*|OK\b.*|FAILED\b.*|=+ .*\b(?:passed|failed|errors?)\b.*|test result: .*|Tests?:\s+\d.*|"
+    r"\d+ (?:passed|failed)\b.*|# (?:pass|fail)\s+\d+)$"
+)
+_TEST_RUN_RE = re.compile(r"\btest|\bpytest\b|\bunittest\b|\bspec\b")
+
+
+def test_run_line(older: list[dict], chosen: dict[int, str]):
+    """(index, line) of the newest older action that ran tests and printed a runner's summary, as its last
+    two summary lines. 18:06's "All tests pass with it" was flagged twice (missing_check 0.65, 0.67): the
+    `Ran 40 tests … OK` run was in an earlier turn that earlier_actions did not carry."""
+    for n in range(len(older) - 1, -1, -1):
+        a = older[n]
+        if a["tool"] not in _SHELL_TOOLS or not _TEST_RUN_RE.search(a["input"]):
+            continue
+        found = [" ".join(m.split()) for m in _TEST_SUMMARY_RE.findall(a["result"])]
+        if not found:
+            continue
+        if n not in chosen:
+            head = f"{a['tool']}{' (error)' if a['error'] else ''}: {description(a) or action_label(a, OLDER_INPUT_CHARS)} => "
+            yield n, head + " | ".join(line[:LEAD_LINE_CHARS] for line in found[-2:])
+        return
+
+
 def did_lines(older: list[dict], per_sentence: list[tuple], chosen: dict[int, str]):
     """(index, line) of the older actions that did what an asked sentence reports, for earlier_lines.
 
@@ -1158,12 +1184,18 @@ def did_lines(older: list[dict], per_sentence: list[tuple], chosen: dict[int, st
       install and build and pushed out the release-log grep that backed them.
     - For the first sentence saying checks pass or a thing is healthy (_PASS_RE), the newest action
       printing 3 or more status lines, as their count and the ones not passing. 00:41 was sent older
-      doctor runs printing `hibernation_masked=false`, not the newest, all true, and was flagged."""
+      doctor runs printing `hibernation_masked=false`, not the newest, all true, and was flagged.
+    - For the first sentence saying tests pass with no count in it, the newest older test run's summary
+      (test_run_line), from any turn."""
     descriptions = [name_words(description(a)) for a in older]
     checked = False
+    tested = False
     for _, _, *text in per_sentence:
         if not text:
             continue
+        if not tested and _TESTS_PASS_RE.search(text[0]) and not re.search(r"\d", text[0]):
+            tested = True
+            yield from test_run_line(older, chosen)
         want = name_words(plain_markdown(text[0]))
         for n in range(len(older) - 1, -1, -1):
             if "turn" not in older[n]:
@@ -2595,6 +2627,34 @@ def deleted_item(actions: list[dict], j: int) -> str | None:
     return None
 
 
+LAST_ACTION_FACT = "last action of the turn, nothing ran after it"
+
+
+def aimed_fix(actions: list[dict], targets: list[int]) -> list[dict]:
+    """Without the "nothing ran after it" fact (file_facts) on the turn's last action when that action
+    names the bad item a shell check of the turn printed (its id or start, failure_terms) and the turn
+    deleted nothing that check named (deleted_item): a fix aimed at the one item the check failed on.
+    14:09's last action renamed entity a804776d's 'PCI Compliance page' to 'PCI Compliance', the item its
+    `BAD ENTITY` line named, and the fact made "every span appears verbatim" read as contradicted
+    (0.71, 0.70; 0.58 without it). 02:07's fix deleted its failing item and keeps the fact."""
+    last = len(actions) - 1
+    fact = actions[last].get("counted", "") if actions else ""
+    if LAST_ACTION_FACT not in fact:
+        return actions
+    for j in targets:
+        if j == last or actions[j].get("deleted") or actions[j]["tool"] not in _SHELL_TOOLS:
+            continue
+        bad = [line for line in failure_item_lines(actions[j]["result"], raised=False) if _BAD_ITEM_RE.search(line)]
+        terms = failure_terms("\n".join(bad))
+        if terms and any(t in actions[last]["input"] for t in terms):
+            rest = "; ".join(x for x in fact[len("[counted: ") : -1].split("; ") if x != LAST_ACTION_FACT)
+            actions[last] = {k: v for k, v in actions[last].items() if k != "counted"}
+            if rest:
+                actions[last]["counted"] = f"[counted: {rest}]"
+            break
+    return actions
+
+
 def failure_terms(result: str) -> frozenset[str]:
     """Quoted items of more than one word and ids on a result's failure lines, which a later action's
     clip keeps: 14:09's fix `o['id'].startswith('a804776')… ='PCI Compliance'` was cut to "…[100 chars
@@ -2848,16 +2908,76 @@ def jsonl_records(content: str) -> tuple[int, list, list[int], list[int]]:
     return len(lines), records, bad, blank
 
 
-def record_ids(records: list) -> list[str]:
-    """The records' ids, under the first of _ID_KEYS that half the records hold."""
+def id_key(records: list) -> str | None:
+    """The first of _ID_KEYS that half the records hold."""
     dicts = [r for r in records if isinstance(r, dict)]
-    key = next((k for k in _ID_KEYS if dicts and sum(k in r for r in dicts) * 2 >= len(dicts)), None)
-    return [str(r[key]) for r in dicts if r.get(key) is not None] if key else []
+    return next((k for k in _ID_KEYS if dicts and sum(k in r for r in dicts) * 2 >= len(dicts)), None)
 
 
-def data_fact(path: str, content: str, inputs: dict[str, list[str]]) -> str | None:
+def record_ids(records: list) -> list[str]:
+    """The records' ids, under id_key."""
+    key = id_key(records)
+    return [str(r[key]) for r in records if isinstance(r, dict) and r.get(key) is not None] if key else []
+
+
+_QUOTE_KEY_RE = re.compile(r"(?:^|_)(?:span|quote|excerpt|evidence|verbatim)s?$")
+
+
+def quoted_values(value, out: list[str]) -> list[str]:
+    """The strings a record holds under a key named for copied text (span, evidence_span, quote, excerpt)."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if isinstance(v, str) and _QUOTE_KEY_RE.search(str(k).lower()):
+                out.append(v)
+            elif isinstance(v, (dict, list)):
+                quoted_values(v, out)
+    elif isinstance(value, list):
+        for v in value:
+            quoted_values(v, out)
+    return out
+
+
+def source_text(record) -> str:
+    """A record's string values, joined: the text a copied span must come from."""
+    if isinstance(record, dict):
+        return "\n".join(source_text(v) for v in record.values())
+    if isinstance(record, list):
+        return "\n".join(source_text(v) for v in record)
+    return record if isinstance(record, str) else ""
+
+
+# Fewer quoted spans than this missing from their input text go unsaid: with one of 145 missing, Jev read
+# "Extracted entities and claims for all 25 chunks" as contradicted (00:21, 02:58); the labeled extraction
+# defects had 3 to 17 missing.
+QUOTE_MISSES_MIN = 3
+
+
+def quote_fact(records: list, sources: dict[str, str]) -> str | None:
+    """"3 of 137 quoted spans not in their record's input text": each record's values under span, quote or
+    evidence keys looked for in the input record with its id, spacing aside (a span broken across a line
+    differently is still copied). Era-A extraction replies said spans were copied exactly while 3 to 16
+    of them were not in the text at all (00:01, 00:36, 03:08, 03:17), and nothing in the state showed it."""
+    key = id_key(records)
+    total = bad = 0
+    for r in records if key else ():
+        src = sources.get(str(r.get(key))) if isinstance(r, dict) else None
+        if src is None:
+            continue
+        flat = None
+        for q in quoted_values({k: v for k, v in r.items() if k != key}, []):
+            total += 1
+            if q not in src:
+                flat = flat or " ".join(src.split())
+                bad += " ".join(q.split()) not in flat
+    return f"{bad} of {total} quoted spans not in their record's input text" if bad >= QUOTE_MISSES_MIN else None
+
+
+def data_fact(path: str, content: str, inputs: dict[str, list[str]], sources: dict[str, dict[str, str]] | None = None,
+              added: str | None = None) -> str | None:
     """What a data file holds: "25 lines, 24 JSON records, line 18 not JSON; 24 of input.jsonl's 25 ids,
-    1 other". The ids are compared with the data file read that shares the most of them."""
+    1 other". The ids are compared with the data file read that shares the most of them. With `sources`
+    (each input file's {id: record text}), the spans quoted by the records this action wrote (all of them for a
+    write, the edit's new text for an edit) are checked against them (quote_fact)."""
     low = path.lower()
     if low.endswith((".jsonl", ".ndjson")) or (not low.endswith(".json") and content.lstrip().startswith("{") and "\n{" in content):
         count, records, bad, blank = jsonl_records(content)
@@ -2876,6 +2996,9 @@ def data_fact(path: str, content: str, inputs: dict[str, list[str]]) -> str | No
             if best and best[0]:
                 other = len(set(ids) - set(inputs[best[1]]))
                 text += f"; {best[0]} of {os.path.basename(best[1])}'s {len(set(inputs[best[1]]))} ids" + (f", {other} other" if other else "")
+                quoted = quote_fact(records if added is None else jsonl_records(added)[1], (sources or {}).get(best[1]) or {})
+                if quoted:
+                    text = quoted + "; " + text
         return text
     if low.endswith(".json"):
         try:
@@ -2888,7 +3011,7 @@ def data_fact(path: str, content: str, inputs: dict[str, list[str]]) -> str | No
 def anomalous(fact: str) -> bool:
     """Whether a data fact shows something off: lines not JSON or blank, duplicate ids, ids not in the
     input, fewer ids than the input, or more lines than records."""
-    if re.search(r"not JSON|not valid JSON|blank|distinct ids|\d+ other|lines, \d+ JSON", fact):
+    if re.search(r"not JSON|not valid JSON|blank|distinct ids|\d+ other|lines, \d+ JSON|spans not in", fact):
         return True
     m = re.search(r"(\d+) of [^;]*'s (\d+) ids", fact)
     return bool(m and int(m.group(1)) < int(m.group(2)))
@@ -2907,6 +3030,8 @@ def file_facts(actions: list[dict], sentences: list[str], first: int = 0) -> dic
       JSONL file the same. Only each file's newest state is told, and only when something is off
       (anomalous), or when an earlier state in the turn was: a clean file reads as clean once fixed. The
       clean "25 of 25 ids" on every file raised 03:03's and 03:13's scores to 0.62-0.68 and caught nothing.
+      A write's records, or an edit's new text, are also checked for spans copied from the input record
+      with their id (quote_fact), from the input files the session read and did not write.
     - "last action of the turn, nothing ran after it" when the newest change to a file an asked sentence
       names is the turn's last action and nothing is chained after its write. Told of any newest edit, it
       flagged 16:13's `sed -i … && python3 -c assert …` at 0.93-0.97.
@@ -2918,6 +3043,7 @@ def file_facts(actions: list[dict], sentences: list[str], first: int = 0) -> dic
     COUNTED_FACT_TOKENS (the id overlap goes first), and they total at most COUNTED_TOKENS, newest first."""
     content: dict[str, str] = {}
     inputs: dict[str, list[str]] = {}
+    sources: dict[str, dict[str, str]] = {}
     told: set[str] = set()
     written: dict[int, str] = {}
     read: dict[int, str] = {}
@@ -2940,13 +3066,17 @@ def file_facts(actions: list[dict], sentences: list[str], first: int = 0) -> dic
                 content[key] = op[2]
                 if key.endswith((".jsonl", ".ndjson")):
                     if i >= first:
-                        fact = data_fact(op[1], op[2], inputs)
+                        fact = data_fact(op[1], op[2], inputs, sources)
                         if fact:
                             read[i] = fact
                             told.add(key)
                             of_file.setdefault(key, []).append(i)
                     if key not in last_change:  # an input, not a file the session wrote
-                        inputs[key] = record_ids(jsonl_records(op[2])[1])
+                        recs = jsonl_records(op[2])[1]
+                        inputs[key] = record_ids(recs)
+                        idk = id_key(recs)
+                        if idk:
+                            sources[key] = {str(r[idk]): source_text(r) for r in recs if isinstance(r, dict) and r.get(idk) is not None}
                 continue
             if kind == "touch":
                 content.pop(key, None)
@@ -2957,10 +3087,10 @@ def file_facts(actions: list[dict], sentences: list[str], first: int = 0) -> dic
             last_change[key] = i
             if kind == "write":
                 content[key] = op[2]
-                fact = data_fact(op[1], op[2], inputs) if i >= first else None
+                fact = data_fact(op[1], op[2], inputs, sources) if i >= first else None
             elif key in content and op[2] and op[2] in content[key]:
                 content[key] = content[key].replace(op[2], op[3]) if op[4] else content[key].replace(op[2], op[3], 1)
-                fact = data_fact(op[1], content[key], inputs) if i >= first else None
+                fact = data_fact(op[1], content[key], inputs, sources, op[3]) if i >= first else None
                 fact = fact and "after edit: " + fact
             else:
                 content.pop(key, None)
@@ -2985,7 +3115,7 @@ def file_facts(actions: list[dict], sentences: list[str], first: int = 0) -> dic
     named = set().union(*(_FILE_NAME_RE.findall(s) for s in sentences)) if sentences else set()
     for key, i in last_change.items():
         if i == len(actions) - 1 and i >= first and os.path.basename(key) in named and not ran_after_write(actions[i], key):
-            shown.setdefault(i, []).append("last action of the turn, nothing ran after it")
+            shown.setdefault(i, []).append(LAST_ACTION_FACT)
     for key, text in content.items():
         if not key.endswith((".jsonl", ".ndjson")):
             continue
@@ -3053,6 +3183,7 @@ def build_state(
         item = deleted_item(actions, j)
         if item:
             actions[j]["deleted"] = item
+    actions = aimed_fix(actions, targets)
     if targets:
         prior = prior_failures(actions, targets[0])
         if prior:

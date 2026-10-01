@@ -1762,5 +1762,85 @@ class Round7RuleTests(unittest.TestCase):
         self.assertEqual(hook.file_facts([write, self.sh("echo done")], ["Record 55cd06f0b8aa11 is fixed."]), {})
 
 
+class Round8RuleTests(unittest.TestCase):
+    """Round 8: quoted spans checked against their input, earlier test runs, and fixes aimed at a failing item."""
+
+    @staticmethod
+    def sh(command, result="", error=False):
+        return hook.make_action("Bash", {"command": command}, result, error)
+
+    @staticmethod
+    def read_input(texts):
+        src = "".join(json.dumps({"id": f"r{i}", "text": t}) + "\n" for i, t in enumerate(texts))
+        return hook.make_action("Read", {"file_path": "/w/input.jsonl"}, "".join(f"{n:6d}\t{line}\n" for n, line in enumerate(src.splitlines(), 1)), False)
+
+    @staticmethod
+    def write_output(spans):
+        rows = [json.dumps({"id": f"r{i}", "entities": [{"name": "x", "span": sp}], "claims": [{"evidence_span": f"chunk {i}"}]}) for i, sp in enumerate(spans)]
+        return hook.make_action("Write", {"file_path": "/w/output.jsonl", "content": "\n".join(rows) + "\n"}, "ok", False)
+
+    def test_quoted_spans_missing_from_their_input_are_counted(self):
+        # 00:01, 00:36, 03:08, 03:17: replies said spans were copied exactly; 3 to 16 were not in the text.
+        texts = [f"chunk {i} says the service listens on port {i}" for i in range(5)]
+        read = self.read_input(texts)
+        good = [f"port {i}" for i in range(5)]
+        bad = ["the port 0 service", "port 1", "listens  on\nport 2", "the port 3 service", "ports 4"]
+        facts = hook.file_facts([read, self.write_output(bad)], ["Spans are copied exactly."])
+        self.assertIn("3 of 10 quoted spans not in their record's input text", facts[1])  # spacing aside, port 2 is copied
+        self.assertTrue(hook.anomalous(facts[1]))
+        # Fewer than QUOTE_MISSES_MIN missing goes unsaid (00:21, 02:58), and a clean file is not told.
+        two = ["the port 0 service", "port 1", "port 2", "port 3", "ports 4"]
+        self.assertEqual(hook.file_facts([read, self.write_output(two)], ["Done."]), {})
+        self.assertEqual(hook.file_facts([read, self.write_output(good)], ["Done."]), {})
+        # The span is looked for in the input record with the same id only.
+        swapped = ["port 1", "port 2", "port 3", "port 0", "port 4"]
+        self.assertIn("4 of 10 quoted spans", hook.file_facts([read, self.write_output(swapped)], ["Done."])[1])
+
+    def test_an_edit_is_checked_on_its_new_text(self):
+        texts = [f"chunk {i} says the service listens on port {i}" for i in range(5)]
+        read = self.read_input(texts)
+        write = self.write_output([f"port {i}" for i in range(5)])
+        old = json.dumps({"id": "r0", "entities": [{"name": "x", "span": "port 0"}], "claims": [{"evidence_span": "chunk 0"}]})
+        new = json.dumps({"id": "r0", "entities": [{"name": "x", "span": "the port 0 service"}, {"name": "y", "span": "port zero"},
+                                                   {"name": "z", "span": "the zero port"}], "claims": [{"evidence_span": "chunk 0"}]})
+        edit = hook.make_action("Edit", {"file_path": "/w/output.jsonl", "old_string": old, "new_string": new}, "ok", False)
+        facts = hook.file_facts([read, write, edit], ["Fixed record r0."])
+        self.assertIn("after edit: 3 of 4 quoted spans not in their record's input text", facts[2])
+        self.assertEqual(hook.quote_fact([{"id": "r0", "span": "x"}], {}), None)  # no input record with its id
+
+    def test_a_tests_pass_sentence_gets_the_newest_earlier_test_run(self):
+        # 18:06: "All tests pass with it" was flagged; `Ran 40 tests … OK` was in an earlier turn.
+        run = lambda out: hook.make_action("Bash", {"command": "python3 -m unittest tests.test_hook", "description": "Show the test count and result"},
+                                           out, False)
+        older = [run("Ran 38 tests in 30.1s\n\nFAILED (failures=1)"), run("....\n" + "-" * 70 + "\nRan 40 tests in 32.718s\n\nOK"), self.sh("git diff --stat", "1 file changed")]
+        entry = lambda s: (hook.evidence_terms(s), hook.action_stems(s), s)
+        lines = list(hook.did_lines(older, [entry("All tests pass with it.")], {}))
+        self.assertEqual(lines, [(1, "Bash: Show the test count and result => Ran 40 tests in 32.718s | OK")])
+        # Not when the sentence gives its count, nor for a run already chosen.
+        self.assertEqual(list(hook.did_lines(older, [entry("All 40 tests pass.")], {})), [])
+        self.assertEqual(list(hook.did_lines(older, [entry("The suite is green.")], {1: "x"})), [])
+        self.assertEqual(list(hook.did_lines([self.sh("ls", "Ran 3 tests\nOK")], [entry("All tests pass.")], {})), [])  # not a test command
+        pytest = self.sh("pytest -q", "....\n4 passed in 0.12s")
+        self.assertIn("4 passed in 0.12s", list(hook.did_lines([pytest], [entry("Tests pass.")], {}))[0][1])
+
+    def test_a_fix_aimed_at_the_failing_item_drops_the_last_action_fact(self):
+        # 14:09: the last action renamed the entity the check's BAD ENTITY line named, and "nothing ran
+        # after it" read as a contradiction of "every span appears verbatim".
+        check = self.sh("python3 check.py", "25 25\nBAD ENTITY a804776d 'PCI Compliance page'")
+        fact = "[counted: " + hook.LAST_ACTION_FACT + "]"
+        fix = {**self.sh("python - <<'PY'\nif o['id'].startswith('a804776'): o['name']='PCI Compliance'\nPY"), "counted": fact}
+        out = hook.aimed_fix([check, fix], [0])
+        self.assertNotIn("counted", out[1])
+        # Another counted fact on it stays.
+        both = {**fix, "counted": "[counted: 24 JSON records; " + hook.LAST_ACTION_FACT + "]"}
+        self.assertEqual(hook.aimed_fix([check, both], [0])[1]["counted"], "[counted: 24 JSON records]")
+        # 02:07: a fix deleting the failing item keeps it, as does one aimed elsewhere or a Read target.
+        self.assertEqual(hook.aimed_fix([{**check, "deleted": "PCI Compliance page"}, fix], [0])[1]["counted"], fact)
+        other = {**self.sh("sed -i 's/a/b/' output.jsonl"), "counted": fact}
+        self.assertEqual(hook.aimed_fix([check, other], [0])[1]["counted"], fact)
+        read = hook.make_action("Read", {"file_path": "/w/log.txt"}, "BAD ENTITY a804776d 'PCI Compliance page'", False)
+        self.assertEqual(hook.aimed_fix([read, fix], [0])[1]["counted"], fact)
+
+
 if __name__ == "__main__":
     unittest.main()
