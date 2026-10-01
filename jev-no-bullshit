@@ -791,16 +791,27 @@ def _plain_term(text: str) -> str:
     return re.sub(r"[\"'`\s]", "", text.lower())
 
 
-def evidence_hits(text: str, evidence: tuple[set[str], set[str]]) -> int:
-    """How many of the evidence's numbers and code terms a text holds. A term holding `:` or `=` also
-    matches with case, quotes and spaces ignored: 00:29's `Origin: null` is printed `"origin":"null"`,
-    and the line showing it was not picked."""
+def number_set(text: str) -> set[str]:
+    """The numbers a text holds, without digit-group separators ("1,040" is "1040")."""
+    return {_DIGIT_GROUP_RE.sub("", n) if "," in n or "_" in n else n for n in set(_NUMBER_RE.findall(text))}
+
+
+def held_by(text: str, numbers: bool, plain: bool) -> tuple[set[str] | None, str | None]:
+    """What evidence_hits reads from a text, found once for many calls: its number_set when `numbers`,
+    and its _plain_term when `plain`."""
+    return number_set(text) if numbers else None, _plain_term(text) if plain else None
+
+
+def evidence_hits(text: str, evidence: tuple[set[str], set[str]], held: tuple[set[str] | None, str | None] | None = None) -> int:
+    """How many of the evidence's numbers and code terms a text holds; `held` is the text's held_by, when
+    already found. A term holding `:` or `=` also matches with case, quotes and spaces ignored: 00:29's
+    `Origin: null` is printed `"origin":"null"`, and the line showing it was not picked."""
     numbers, terms = evidence
-    found = set(_DIGIT_GROUP_RE.sub("", n) for n in _NUMBER_RE.findall(text)) & numbers
+    found = (held[0] if held and held[0] is not None else number_set(text)) & numbers if numbers else set()
     hits = sum(1 for t in terms if t in text)
     rest = [t for t in terms if t not in text and len(t) >= 6 and (":" in t or "=" in t)]
     if rest:
-        plain = _plain_term(text)
+        plain = held[1] if held and held[1] is not None else _plain_term(text)
         hits += sum(1 for t in rest if _plain_term(t) in plain)
     return len(found) + hits
 
@@ -917,11 +928,11 @@ def tail(text: str, limit: int) -> str:
     return text if len(text) <= limit else "…" + text[-(limit - 1) :]
 
 
-def relevance(action: dict, evidence: tuple[set[str], set[str]], stems: set[str]) -> int:
+def relevance(action: dict, evidence: tuple[set[str], set[str]], stems: set[str], held: tuple | None = None) -> int:
     """How many of the asked sentences' numbers and code terms an action's input and result hold, and
-    of their action verbs its input spells."""
+    of their action verbs its input spells; `held` is held_by of its input and result, when found."""
     low = action["input"].lower()
-    return evidence_hits(action["input"] + "\n" + action["result"], evidence) + sum(1 for stem in stems if stem in low)
+    return evidence_hits(action["input"] + "\n" + action["result"], evidence, held) + sum(1 for stem in stems if stem in low)
 
 
 def relevant(action: dict, evidence: tuple[set[str], set[str]], stems: set[str]) -> bool:
@@ -1020,15 +1031,43 @@ def counts_shown(text: str, pairs: frozenset[tuple[str, str]]) -> set[str]:
     """The numbers of `pairs` the text shows followed within two words by their noun ("Ran 40 tests"),
     or right after it as a label's value ("suites: 22"; 17:52's "all 22 suites passed" got a line whose
     only 22 was in a date, "Sep 19 22:22:45")."""
+    # A match starts where the number or the noun does, so each pattern is tried only there, and a text
+    # holding neither is not searched: searched whole every time, a session of 9,491 entries spent 15 of
+    # its 30 seconds here.
+    pairs = [(n, noun) for n, noun in pairs if n in text]
+    if not pairs:
+        return set()
     low, shown = text.lower(), set()
     for n, noun in pairs:
-        num = r"(?<![\d.:])" + re.escape(n) + r"(?![\d:]|\.\d)"
-        if n not in shown and (
-            re.search(num + r"\s+(?:[a-z-]+\s+){0,2}" + re.escape(noun), low)
-            or re.search(r"\b" + re.escape(noun) + r"[a-z]{0,3}\s*[:=]\s*" + num, low)
-        ):
+        if n in shown or noun not in low:
+            continue
+        after, label = _count_patterns(n, noun)
+        if any(after.match(low, i) for i in _starts(low, n)) or any(label.match(low, i) for i in _starts(low, noun)):
             shown.add(n)
     return shown
+
+
+def _starts(text: str, part: str):
+    """Every index where `part` starts in `text`, overlapping ones included."""
+    i = text.find(part)
+    while i >= 0:
+        yield i
+        i = text.find(part, i + 1)
+
+
+_COUNT_PATTERNS: dict[tuple[str, str], tuple[re.Pattern, re.Pattern]] = {}
+
+
+def _count_patterns(n: str, noun: str) -> tuple[re.Pattern, re.Pattern]:
+    """counts_shown's two patterns for a pair, compiled once."""
+    found = _COUNT_PATTERNS.get((n, noun))
+    if found is None:
+        num = r"(?<![\d.:])" + re.escape(n) + r"(?![\d:]|\.\d)"
+        found = _COUNT_PATTERNS[(n, noun)] = (
+            re.compile(num + r"\s+(?:[a-z-]+\s+){0,2}" + re.escape(noun)),
+            re.compile(r"\b" + re.escape(noun) + r"[a-z]{0,3}\s*[:=]\s*" + num),
+        )
+    return found
 
 
 def unbacked(evidence: tuple[set[str], set[str]], text: str) -> tuple[set[str], set[str]]:
@@ -1179,6 +1218,7 @@ def hex_pins(older: list[dict], newest: dict | None) -> dict[int, list[str]]:
 def earlier_lines(
     older: list[dict], evidence: tuple[set[str], set[str]], stems: set[str], side_effects: bool, room: float,
     per_sentence: list[tuple] = (), only_sentences: bool = False, pinned: dict[int, list[str]] | None = None,
+    memo: dict | None = None,
 ) -> list[str]:
     """The actions not sent whole that bear on the asked sentences, as one line each, up to
     EARLIER_ACTIONS_TOKENS: first the best line for each asked sentence in turn (`per_sentence`, each
@@ -1202,7 +1242,12 @@ def earlier_lines(
     only the lines chosen for the sentences are returned.
 
     Before those go the lines did_lines picks, within EXTRA_SHARE of the room, and the line of each
-    `pinned` action (index: the values its result shares with the newest action's)."""
+    `pinned` action (index: the values its result shares with the newest action's).
+
+    `memo` keeps what is found about each action for the next call with the same `memo`: build_state's
+    three calls share most of their older actions, and at 3,366 of them each call took half a second.
+    An entry holds its action, so no other action gets its id while the memo lives."""
+    memo = {} if memo is None else memo
     newest: dict[str, int] = {}
     for n, a in enumerate(older):
         family = command_family(a)
@@ -1221,8 +1266,12 @@ def earlier_lines(
             n = m
         if n in chosen:
             return True
-        line = one_line_action(older[n], evidence, pairs, own)
-        cost = ITEM_OVERHEAD_TOKENS + estimate_tokens(line)
+        key = ("line", id(older[n]), pairs, id(own))
+        hit = memo.get(key)
+        if not (hit and hit[0] is older[n] and hit[1] is own and hit[2] is evidence):
+            line = one_line_action(older[n], evidence, pairs, own)
+            hit = memo[key] = (older[n], own, evidence, line, ITEM_OVERHEAD_TOKENS + estimate_tokens(line))
+        line, cost = hit[3], hit[4]
         if cost > left:
             return False
         left -= cost
@@ -1250,33 +1299,64 @@ def earlier_lines(
         lines = [line.strip()[:LEAD_LINE_CHARS] for line in a["result"].splitlines() if any(h in line for h in hexes)]
         same = f" (same line x{len(lines)})" if len(lines) > 1 and len(set(lines)) == 1 else ""
         put(n, f"{a['tool']}: {action_label(a, OLDER_INPUT_CHARS)} => {lines[0]}{same}", left)
-    texts = [a["input"] + "\n" + a["result"] for a in older] if per_sentence else []
-    for own, verbs, *text in per_sentence:
+    # What each action holds is found once, not once per sentence: found per sentence, the slowest
+    # check (3,366 older actions) took 4.4 seconds.
+    numbered = any(numbers for (numbers, _), *_ in per_sentence)
+    plain = any(len(t) >= 6 and (":" in t or "=" in t) for (_, terms), *_ in per_sentence for t in terms)
+
+    def look(a: dict) -> tuple:
+        """(the action, its result without line numbers, its input and result, their held_by, its input lowercased)."""
+        key = ("seen", id(a), numbered, plain)
+        hit = memo.get(key)
+        if not (hit and hit[0] is a):
+            result, text = _LINE_NUMBER_RE.sub("", a["result"]), a["input"] + "\n" + a["result"]
+            hit = memo[key] = (a, result, text, held_by(result, numbered, plain), held_by(text, numbered, plain), a["input"].lower())
+        return hit
+
+    seen = [look(a) for a in older] if per_sentence else []
+    texts = [s[2] for s in seen]
+    for entry in per_sentence:
+        own, verbs, *text = entry
         pairs = count_pairs(text[0]) if text else frozenset()
         # A count or term a result shows ranks before one only an input spells: 11:35's "the 33 offline
         # tests pass" got a doc edit whose text said "33 tests", not the run printing "Ran 33 tests". A
-        # file read's line numbers ("25→") are no evidence.
-        ranked = sorted(
-            ((len(counts_shown(a["result"], pairs)) if pairs else 0, len(counts_shown(t, pairs)) if pairs else 0,
-              evidence_hits(_LINE_NUMBER_RE.sub("", a["result"]), own), evidence_hits(t, own), relevance(a, own, verbs), n)
-             for n, (a, t) in enumerate(zip(older, texts))),
-            key=lambda p: tuple(-x for x in p),
-        )
+        # file read's line numbers ("25→") are no evidence. Last, the most of the sentence's verbs its
+        # input spells; an action showing none of the rest ranks below all that do and is never taken,
+        # so it is left out.
+        ranked = []
+        for n, (a, result, t, held_result, held_text, low) in enumerate(seen):
+            key = ("rank", id(a), id(entry))
+            hit = memo.get(key)
+            if not (hit and hit[0] is a and hit[1] is entry):
+                rank = ((len(counts_shown(a["result"], pairs)), len(counts_shown(t, pairs))) if pairs else (0, 0)) + (
+                    evidence_hits(result, own, held_result), evidence_hits(t, own, held_text))
+                hit = memo[key] = (a, entry, (*rank, rank[3] + sum(1 for stem in verbs if stem in low)) if any(rank) else None)
+            if hit[2]:
+                ranked.append((*hit[2], n))
+        ranked.sort(key=lambda p: tuple(-x for x in p))
         for *_, hits, _, n in ranked:
             if not hits or take(n, pairs, own):
                 break
         wanted = {n for n, _ in pairs} - set().union(*(counts_shown(line, pairs) for line in chosen.values()))
         for count in sorted(wanted):
-            n = next((n for n in range(len(texts) - 1, -1, -1) if count in counts_shown(texts[n], pairs)), None)
+            mine = frozenset(p for p in pairs if p[0] == count)
+            n = next((n for n in range(len(texts) - 1, -1, -1) if count in texts[n] and counts_shown(texts[n], mine)), None)
             if n is not None:
                 take(n, pairs, own)
     if only_sentences:
         return list(chosen.values())
-    scored = [(relevance(a, evidence, stems), n) for n, a in enumerate(older)]
+    scored = [(relevance(a, evidence, stems, seen[n][4] if seen else None), n) for n, a in enumerate(older)]
     for hits, n in sorted(((h, n) for h, n in scored if h), key=lambda p: (-p[0], -p[1])):
         take(n)
     if side_effects:
-        for n in reversed([n for n, a in enumerate(older) if has_side_effect(a)][-SIDE_EFFECT_ACTIONS:]):
+        # The newest SIDE_EFFECT_ACTIONS, newest first, found from the newest back.
+        writes = []
+        for n in range(len(older) - 1, -1, -1):
+            if len(writes) == SIDE_EFFECT_ACTIONS:
+                break
+            if has_side_effect(older[n]):
+                writes.append(n)
+        for n in writes:
             if n in chosen:
                 continue
             line = f"{older[n]['tool']}{' (error)' if older[n]['error'] else ''}: {action_label(older[n], SIDE_EFFECT_CHARS)}"
@@ -2236,6 +2316,10 @@ _GUTTER_RE = re.compile(r"^( *\d+\t)(.*)$")
 
 
 def _json_value(text: str):
+    # Only an object or an array is wanted, and only those start so: most lines are no JSON, and
+    # failing to parse each took a quarter of a long session's check.
+    if not text.lstrip(" \t\n\r").startswith(("{", "[")):
+        return None
     try:
         value = json.loads(text)
     except ValueError:
@@ -2994,8 +3078,9 @@ def build_state(
     # Each asked sentence's best action line is kept before older messages take their room: a message
     # restating an earlier run ("both over the 0.65 bar", "206 of 210") was read as contradicting the
     # newer result, which it had pushed out. Older assistant messages go in only for what no action shows.
+    memo: dict = {}  # earlier_lines' findings, shared by its three calls here
     best = earlier_lines(earlier + actions[:-1], evidence, stems, False, EARLIER_ACTIONS_TOKENS, per_sentence, only_sentences=True,
-                         pinned=hex_pins(earlier + actions[:-1], actions[-1] if actions else None))
+                         pinned=hex_pins(earlier + actions[:-1], actions[-1] if actions else None), memo=memo)
     best_cost = sum(ITEM_OVERHEAD_TOKENS + estimate_tokens(line) for line in best)
     message_room = OLDER_MESSAGES_TOKENS - min(OLDER_MESSAGES_TOKENS, best_cost * BEST_LINES_MESSAGE_SHARE)
     sentences = sentence_entries(summary)
@@ -3020,7 +3105,7 @@ def build_state(
     side_effects = any(_NEGATIVE_RE.search(plain_markdown(entries[i][1])) for i in asked)
     room = budget - cost(state)
     floor = max(EARLIER_FLOOR_TOKENS, best_cost) * scale
-    reserve = estimate_tokens(earlier_lines(earlier, evidence, stems, side_effects, max(room, 0), per_sentence))
+    reserve = estimate_tokens(earlier_lines(earlier, evidence, stems, side_effects, max(room, 0), per_sentence, memo=memo))
     whole = actions
     start_room = room
     actions = fill(actions, room - reserve, clipped, evidence, stems)
@@ -3119,7 +3204,7 @@ def build_state(
     # get no paltering questions. They have a floor of room the newest action cannot take.
     older = earlier + actions[: len(actions) - kept] + omitted
     state["earlier_actions"] = earlier_lines(older, evidence, stems, side_effects, max(room, floor), per_sentence,
-                                             pinned=hex_pins(older, actions[-1] if actions else None))
+                                             pinned=hex_pins(older, actions[-1] if actions else None), memo=memo)
     # An older action's counted fact goes as a line of its own.
     state["earlier_actions"] += [f"{a['tool']}: {a['counted_file']} => {a['counted']}" for a in earlier + actions[: len(actions) - kept] if a.get("counted")]
     change = rerun_change(whole[-1], earlier) if whole else None

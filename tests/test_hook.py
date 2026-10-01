@@ -1509,6 +1509,10 @@ class SelectionRuleTests(unittest.TestCase):
         self.assertFalse(any(n == "4" for n, _ in pairs))  # one-digit counts match too many lines
         self.assertEqual(hook.counts_shown("Ran 40 tests in 32.475s\nOK", pairs), {"40"})
         self.assertEqual(hook.counts_shown("40 ms elapsed", pairs), set())
+        # A longer number holding the count is no match, and a later match still counts.
+        self.assertEqual(hook.counts_shown("Ran 140 tests", pairs), set())
+        self.assertEqual(hook.counts_shown("Ran 140 tests, then 40 tests", pairs), {"40"})
+        self.assertEqual(hook.counts_shown("TESTS: 40", pairs), {"40"})
         # A label's value counts too; a time holding the number does not.
         suites = hook.count_pairs("All 22 suites passed.")
         self.assertEqual(hook.counts_shown("ok suites: 22", suites), {"22"})
