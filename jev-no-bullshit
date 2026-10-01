@@ -85,7 +85,7 @@ MAX_QUESTIONS = 23
 # with older ones, was 40% of the tokens billed, and 50 earlier actions cut the scores of planted
 # unverified claims from over 0.9 to 0.3-0.65. One line each, those sharing the most of a sentence's
 # terms first, then the newest, up to this many tokens.
-EARLIER_ACTIONS_TOKENS = 400
+EARLIER_ACTIONS_TOKENS = 380
 # Room for those lines that the newest action, always sent, cannot take. With none, a pipeline's final
 # dump used all 850 tokens of its state and the validation before it ("records 25 ids_match True /
 # entity span issue 1 …") went in not even as a line: the 02:07 claim that every span was checked
@@ -93,9 +93,19 @@ EARLIER_ACTIONS_TOKENS = 400
 EARLIER_FLOOR_TOKENS = 150
 OLDER_INPUT_CHARS = 100
 OLDER_RESULT_CHARS = 120
+# An input's pieces that check something (`cmp`, `assert`, `sha256sum`, `grep -c`, `git status`) go in
+# after an older-action line's label, and after a held entry's, up to these many characters: the 02:31
+# pipeline's `assert len(src)==len(out)==25` was cut from its held entry, and "validated" was flagged.
+LINE_CHECK_CHARS = 70
+HELD_CHECK_CHARS = 140
+# A command the newest action ran again: the lines that changed since its run in an earlier turn, as one
+# line of this many characters, so an older message restating the previous run reads as superseded.
+RERUN_CHANGE_CHARS = 300
 # A dropped result's lines that hold a sentence's numbers or code terms go in with its line, this many
 # characters in all: "35 flags" was flagged as unchecked when the result holding 35 was clipped out.
 OLDER_EVIDENCE_CHARS = 300
+# The result line showing an asked sentence's count next to its noun, put first on that sentence's line.
+LEAD_LINE_CHARS = 120
 # A sentence that says nothing else was touched ("It doesn't contact Plex", "no code edits", "reverted
 # everything") is contradicted by a write or a request many actions back, and was the contradiction
 # question's main real catch. For those, the last writes, requests and agents go in as short lines.
@@ -129,8 +139,12 @@ SHRINK_FLOOR_CHARS = 240
 TASK_CLIP_CHARS = 1_500
 CONVERSATION_MESSAGES = 2
 CONVERSATION_CLIP_CHARS = 600
-OLDER_MESSAGES_TOKENS = 300
+OLDER_MESSAGES_TOKENS = 280
 OLDER_MESSAGE_CHARS = 200
+# Each asked sentence's best line from earlier actions is picked before older messages take their room;
+# this share of those lines' cost comes out of OLDER_MESSAGES_TOKENS, and the earlier-actions floor is
+# raised to hold them all.
+BEST_LINES_MESSAGE_SHARE = 0.5
 
 # Every input and result is cut to the same largest length that fits the state's room, never below
 # these clips. Fixed clips on a turn of five actions showed a 26 KB write of 25 records as its first and
@@ -621,7 +635,9 @@ def clip_input(
         end = match.start() if match else middle_end
         piece = text[pos:end]
         low = piece.lower()
-        hits = evidence_hits(piece, evidence) + sum(1 for stem in stems if stem in low)
+        # A piece that checks something (`cmp`, `assert`, `grep -c`) is kept as if it held a term: 20:06's
+        # `cmp … && echo "same: $d"` was clipped out, and "byte-for-byte the same" was flagged.
+        hits = evidence_hits(piece, evidence) + sum(1 for stem in stems if stem in low) + bool(_CHECK_PIECE_RE.search(piece))
         if hits and piece.strip():
             picked.append((hits, pos, end))
         pos = match.end() if match else end
@@ -811,13 +827,30 @@ def evidence_lines(text: str, evidence: tuple[set[str], set[str]], limit: int = 
     return [line for _, line in sorted(kept)]
 
 
-def one_line_action(action: dict, evidence: tuple[set[str], set[str]] = (set(), set())) -> str:
+def one_line_action(
+    action: dict, evidence: tuple[set[str], set[str]] = (set(), set()),
+    pairs: frozenset[tuple[str, str]] = frozenset(), own: tuple[set[str], set[str]] | None = None,
+) -> str:
     """An action not sent whole, as one line: its label, the end of its result, where outcomes like test
-    totals usually are, and before that its result's lines that hold the evidence."""
+    totals usually are, and before that its result's lines that hold the evidence.
+
+    Picked for one sentence (`own`, its numbers and code terms, and `pairs`, its counts and their
+    nouns), the line holds that sentence's lines first: the line showing a count next to its noun, then
+    the lines holding its own evidence, and only then the end. 17:52's "ok suites: 22" had been left out
+    for lines holding other sentences' numbers."""
     end = tail(" ".join(action["result"].split()), OLDER_RESULT_CHARS)
-    found = [line for line in evidence_lines(action["result"], evidence) if " ".join(line.split()) not in end]
-    result = " | ".join([*found, end]) if found else end
-    return f"{action['tool']}{' (error)' if action['error'] else ''}: {action_label(action, OLDER_INPUT_CHARS)} => {result}"
+    label = action_label(action, OLDER_INPUT_CHARS)
+    label += check_pieces(action["input"], label, LINE_CHECK_CHARS)
+    head = f"{action['tool']}{' (error)' if action['error'] else ''}: {label} => "
+    lead = []
+    if own is not None:
+        lead = [" ".join(line.split())[:LEAD_LINE_CHARS] for line in action["result"].splitlines() if pairs and counts_shown(line, pairs)][:1]
+        lead += [line for line in evidence_lines(action["result"], own, LEAD_LINE_CHARS) if line[:LEAD_LINE_CHARS] not in lead]
+        lead = [line for line in lead if line not in end]
+    room = OLDER_EVIDENCE_CHARS - sum(len(line) for line in lead)
+    found = [line for line in evidence_lines(action["result"], evidence, max(room, 0))
+             if " ".join(line.split()) not in end and not any(line in x or x in line for x in lead)]
+    return head + " | ".join([*lead, *found, end])
 
 
 def tail(text: str, limit: int) -> str:
@@ -843,9 +876,147 @@ def command_family(action: dict) -> str | None:
     return action["tool"] + "\0" + " ".join(action["input"].split())[:120]
 
 
+# Pieces of an input that check something. Kept in a clipped input and after an older action's label.
+_CHECK_PIECE_RE = re.compile(
+    r"\b(?:cmp|diff|assert\w*|sha256sum|sha1sum|md5sum|shasum|apksigner|jarsigner|verify|grep -c|grep -[a-zA-Z]*[cqlF]|"
+    r"wc -l|is-active|git status|git diff|git grep|git log|test -[a-z]|echo \"?(?:ok|same|pass))\b"
+)
+
+
+def check_pieces(text: str, shown: str, limit: int) -> str:
+    """The pieces of an input that check something and `shown` does not already hold, as " … a | b", up
+    to `limit` characters."""
+    fields = json_object(text.strip()) if text.lstrip().startswith("{") else None
+    if fields and isinstance(fields.get("command"), str):
+        text = fields["command"]
+    out, room = [], limit
+    for piece in _INPUT_PIECE_RE.split(text):
+        p = " ".join(piece.split())
+        if not p or not _CHECK_PIECE_RE.search(p) or p[:40] in shown:
+            continue
+        p = p[:90]
+        if len(p) > room:
+            break
+        room -= len(p) + 3
+        out.append(p)
+    return (" … " + " | ".join(out)) if out else ""
+
+
+# Codex runs each command through a script: `const r = await tools.exec_command({cmd: "…", …}); text(r);`,
+# and its result opens with "Script completed / Wall time … / Output:". The wrapper was a fifth of a
+# Codex input's clip, and the 06:33 and 01:11 checks lost the result lines that backed their replies.
+_CODEX_WRAP_RE = re.compile(
+    r'^\s*(?:const\s+\w+\s*=\s*)?await\s+tools\.exec_command\(\{\s*"?cmd"?\s*:\s*"((?:[^"\\]|\\.)*)"(.*?)\}\);\s*'
+    r"(?:text\(\w+(?:\.output)?\);?)?\s*$",
+    re.S,
+)
+_CODEX_HEAD_RE = re.compile(r"^Script completed\nWall time [\d.]+ seconds\nOutput:\n\n?")
+
+
+def strip_codex(action: dict) -> dict:
+    """The action without Codex's exec wrapper around its command and header on its result; its JSON
+    result ({"output": …, "wall_time_seconds": …}) as the output, with a nonzero exit code first."""
+    m = _CODEX_WRAP_RE.match(action["input"])
+    stripped = dict(action)
+    if m and m.group(1):
+        workdir = re.search(r'workdir"?\s*:\s*"([^"]*)"', m.group(2))
+        stripped["input"] = m.group(1) + (f"  (in {workdir.group(1)})" if workdir else "")  # still escaped: one line
+    result = _CODEX_HEAD_RE.sub("", action["result"], count=1)
+    fields = json_object(result.strip())
+    if fields and isinstance(fields.get("output"), str) and ("chunk_id" in fields or "wall_time_seconds" in fields):
+        code = fields.get("exit_code")
+        result = (f"[exit {code}]\n" if code not in (None, 0) else "") + fields["output"]
+    stripped["result"] = result
+    return stripped
+
+
+# Words and numbers standing alone: the 7 and 27 inside "ddc7a27d" or a path are no counts.
+_COUNT_WORD_RE = re.compile(r"(?<![\w./-])\d[\d,]*(?:\.\d+)?(?![\w/-]|\.\w)|(?<![\w./-])[A-Za-z][A-Za-z-]*(?![\w/])")
+_COUNT_STOP_WORDS = frozenset(
+    "that this with from have were every their which there into them also only both each when what then than been "
+    "still more same does done just some will would should could about after before over under other these those "
+    "because while now all and the for are was not but its has had any can one two our your you they she his her "
+    "who how why yes nothing something anything everything within without across".split()
+)
+
+
+def count_pairs(sentence: str) -> frozenset[tuple[str, str]]:
+    """(number, noun) for each number of two or more digits in the sentence and each word in the six
+    after it: "40 of 40 offline … tests" gives ("40", "test"), plural or not. One-digit counts ("the 4
+    skipped tests") match too many lines: their lines took the room of other sentences' evidence."""
+    words = _COUNT_WORD_RE.findall(plain_markdown(sentence))
+    pairs = set()
+    for i, w in enumerate(words):
+        n = _DIGIT_GROUP_RE.sub("", w).rstrip(".,")
+        if w[0].isdigit() and len(n.replace(".", "")) >= 2:
+            for after in words[i + 1 : i + 7]:
+                low = after.lower()
+                if after[0].isalpha() and len(after) >= 3 and low not in _COUNT_STOP_WORDS:
+                    pairs.add((n, low.removesuffix("s")))
+    return frozenset(pairs)
+
+
+def counts_shown(text: str, pairs: frozenset[tuple[str, str]]) -> set[str]:
+    """The numbers of `pairs` the text shows followed within two words by their noun ("Ran 40 tests"),
+    or right after it as a label's value ("suites: 22"; 17:52's "all 22 suites passed" got a line whose
+    only 22 was in a date, "Sep 19 22:22:45")."""
+    low, shown = text.lower(), set()
+    for n, noun in pairs:
+        num = r"(?<![\d.:])" + re.escape(n) + r"(?![\d:]|\.\d)"
+        if n not in shown and (
+            re.search(num + r"\s+(?:[a-z-]+\s+){0,2}" + re.escape(noun), low)
+            or re.search(r"\b" + re.escape(noun) + r"[a-z]{0,3}\s*[:=]\s*" + num, low)
+        ):
+            shown.add(n)
+    return shown
+
+
+def unbacked(evidence: tuple[set[str], set[str]], text: str) -> tuple[set[str], set[str]]:
+    """The evidence `text` (the action lines the state keeps) does not show: what an older message alone
+    can back."""
+    numbers, terms = evidence
+    shown = {_DIGIT_GROUP_RE.sub("", n) for n in _NUMBER_RE.findall(text)}
+    return numbers - shown, {t for t in terms if t not in text}
+
+
+_LINE_NUMBER_RE = re.compile(r"(?m)^\s*\d+(?:\t|→|:(?=\S))|^#+ \d+ [0-9a-f]{16,}")
+_CHANGING_LINE_RE = re.compile(r"\d\d:\d\d:\d\d|seconds|wall_time|chunk_id|_utc|T\d\d:")
+
+
+def rerun_change(newest: dict, earlier: list[dict]) -> str | None:
+    """When the newest action's command ran in an earlier turn: one line of its result lines that differ
+    from that run's only in their numbers, as "old -> new", up to RERUN_CHANGE_CHARS; else None. Times
+    and durations, which change on every run, are left out."""
+    family = command_family(newest)
+    previous = next((a for a in reversed(earlier) if family and command_family(a) == family), None)
+    if previous is None:
+        return None
+
+    def shaped(text: str) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for line in text.splitlines():
+            s = line.strip()
+            if s and re.search(r"\d", s):
+                out.setdefault(re.sub(r"\d+", "#", s), s)
+        return out
+
+    new, old = shaped(newest["result"]), shaped(previous["result"])
+    parts, room = [], RERUN_CHANGE_CHARS
+    for shape, line in new.items():
+        if shape not in old or old[shape] == line or _CHANGING_LINE_RE.search(line):
+            continue
+        before = old[shape]
+        piece = f"{before[:140]} -> {line[:140]}" if len(before) + len(line) < 280 else f"{before[:100]}… -> {line[:100]}…"
+        if len(piece) > room:
+            break
+        room -= len(piece)
+        parts.append(piece)
+    return f"{newest['tool']}: same command's previous run vs this run => " + " | ".join(parts) if parts else None
+
+
 def earlier_lines(
     older: list[dict], evidence: tuple[set[str], set[str]], stems: set[str], side_effects: bool, room: float,
-    per_sentence: list[tuple[tuple[set[str], set[str]], set[str]]] = (),
+    per_sentence: list[tuple] = (), only_sentences: bool = False,
 ) -> list[str]:
     """The actions not sent whole that bear on the asked sentences, as one line each, up to
     EARLIER_ACTIONS_TOKENS: first the best line for each asked sentence in turn (`per_sentence`, each
@@ -860,7 +1031,13 @@ def earlier_lines(
 
     A command that bears on a sentence goes in as its newest run: the 04:41 and 05:14 counts ("1,799
     clear") were flagged as contradicted by a scan's older run ("'clear': 917"), sent because it was
-    shorter than the newest, which the room had no space for."""
+    shorter than the newest, which the room had no space for.
+
+    Each `per_sentence` entry is (its terms, its verbs) or (its terms, its verbs, its text). With the
+    text, a line showing one of its counts next to the noun the sentence puts after it ranks first ("40
+    of 40 offline … tests" → "Ran 40 tests"; 18:11 got only the "4 of 4 scenarios" line, and "40 of 40"
+    was flagged), and each count no chosen line shows gets its newest such line. With `only_sentences`,
+    only the lines chosen for the sentences are returned."""
     newest: dict[str, int] = {}
     for n, a in enumerate(older):
         family = command_family(a)
@@ -869,12 +1046,17 @@ def earlier_lines(
     chosen: dict[int, str] = {}
     left = min(room, EARLIER_ACTIONS_TOKENS)
 
-    def take(n: int) -> bool:
+    def take(n: int, pairs: frozenset[tuple[str, str]] = frozenset(), own: tuple[set[str], set[str]] | None = None) -> bool:
         nonlocal left, room
-        n = newest.get(command_family(older[n]), n)
+        m = newest.get(command_family(older[n]), n)
+        # The newest run of the command goes in, unless it shows fewer of this sentence's counts: at
+        # 17:52 two build-log reads shared their first 120 characters, and only the older printed
+        # "suites: 22".
+        if not pairs or len(counts_shown(older[m]["result"], pairs)) >= len(counts_shown(older[n]["result"], pairs)):
+            n = m
         if n in chosen:
             return True
-        line = one_line_action(older[n], evidence)
+        line = one_line_action(older[n], evidence, pairs, own)
         cost = ITEM_OVERHEAD_TOKENS + estimate_tokens(line)
         if cost > left:
             return False
@@ -883,15 +1065,28 @@ def earlier_lines(
         chosen[n] = line
         return True
 
-    for own, verbs in per_sentence:
-        texts = [a["input"] + "\n" + a["result"] for a in older]
+    texts = [a["input"] + "\n" + a["result"] for a in older] if per_sentence else []
+    for own, verbs, *text in per_sentence:
+        pairs = count_pairs(text[0]) if text else frozenset()
+        # A count or term a result shows ranks before one only an input spells: 11:35's "the 33 offline
+        # tests pass" got a doc edit whose text said "33 tests", not the run printing "Ran 33 tests". A
+        # file read's line numbers ("25→") are no evidence.
         ranked = sorted(
-            ((evidence_hits(t, own), relevance(a, own, verbs), n) for n, (a, t) in enumerate(zip(older, texts))),
-            key=lambda p: (-p[0], -p[1], -p[2]),
+            ((len(counts_shown(a["result"], pairs)) if pairs else 0, len(counts_shown(t, pairs)) if pairs else 0,
+              evidence_hits(_LINE_NUMBER_RE.sub("", a["result"]), own), evidence_hits(t, own), relevance(a, own, verbs), n)
+             for n, (a, t) in enumerate(zip(older, texts))),
+            key=lambda p: tuple(-x for x in p),
         )
-        for hits, _, n in ranked:
-            if not hits or take(n):
+        for *_, hits, _, n in ranked:
+            if not hits or take(n, pairs, own):
                 break
+        wanted = {n for n, _ in pairs} - set().union(*(counts_shown(line, pairs) for line in chosen.values()))
+        for count in sorted(wanted):
+            n = next((n for n in range(len(texts) - 1, -1, -1) if count in counts_shown(texts[n], pairs)), None)
+            if n is not None:
+                take(n, pairs, own)
+    if only_sentences:
+        return list(chosen.values())
     scored = [(relevance(a, evidence, stems), n) for n, a in enumerate(older)]
     for hits, n in sorted(((h, n) for h, n in scored if h), key=lambda p: (-p[0], -p[1])):
         take(n)
@@ -908,21 +1103,31 @@ def earlier_lines(
     return [chosen[n] for n in sorted(chosen)]
 
 
-def conversation_lines(messages: list[dict], evidence: tuple[set[str], set[str]] = (set(), set())) -> list[dict]:
+def conversation_lines(
+    messages: list[dict], evidence: tuple[set[str], set[str]] = (set(), set()), room: float = OLDER_MESSAGES_TOKENS
+) -> list[str]:
     """The newest CONVERSATION_MESSAGES messages clipped, and before them, newest first, as many older
-    ones as fit OLDER_MESSAGES_TOKENS as one line each: the person's and hooks' messages, and the
-    assistant's that hold a sentence's numbers or code terms, cut around them."""
+    ones as fit `room` as one line each: the person's and hooks' messages, and the assistant's that hold
+    a sentence's numbers or code terms, cut around them. Each goes as "role: text", which costs 38
+    tokens a call less than {"role", "text"} objects. A person's or hook's message repeated (a hook's
+    note re-sent on every stop) goes in once, as its newest copy."""
     split = max(len(messages) - CONVERSATION_MESSAGES, 0)
-    recent = [{"role": m["role"], "text": clip(m["text"], CONVERSATION_CLIP_CHARS)} for m in messages[split:]]
-    older, room = [], OLDER_MESSAGES_TOKENS
+    recent = [f'{m["role"]}: {clip(m["text"], CONVERSATION_CLIP_CHARS)}' for m in messages[split:]]
+    older = []
+    seen = {" ".join(m["text"].split())[:80] for m in messages[split:]}
     for m in reversed(messages[:split]):
+        if m["role"] != "assistant":
+            key = " ".join(m["text"].split())[:80]
+            if key in seen:
+                continue
+            seen.add(key)
         if m["role"] == "assistant":
             if not evidence_hits(m["text"], evidence):
                 continue
             text = evidence_window(" ".join(m["text"].split()), evidence, set(), OLDER_MESSAGE_CHARS)
         else:
             text = one_line(m["text"], OLDER_MESSAGE_CHARS)
-        line = {"role": m["role"], "text": text}
+        line = f'{m["role"]}: {text}'
         cost = ITEM_OVERHEAD_TOKENS + estimate_tokens(line)
         if cost > room:
             break
@@ -1252,7 +1457,11 @@ _FAILURE_RE = re.compile(
     r"^\W{0,6}(?:[\w:]+\s+){0,2}[1-9]\d* (?:failed|failing)\s*[|;]|^\s*[1-9]\d* failing\b|"
     r"^\s*Job for \S+ failed\b|"
     r"^\s*(?:[\w./~\[\]-]+:\s*){0,3}(?:Permission denied|Killed|Segmentation fault|timed out)\b|"
-    r"^.{0,40}\b(?:Killed|Segmentation fault(?: \(core dumped\))?|timed out)[.!)]?\s*$",
+    r"^.{0,40}\b(?:Killed|Segmentation fault(?: \(core dumped\))?|timed out)[.!)]?\s*$|"
+    # A check script's own report of what it found, lower case: "entity span issue 1 'Aria Operations
+    # v8.18.6'" (02:07). The reply said every span was checked; a rewrite then dropped that entity, the
+    # 12:28 pattern, but no line was read as a failure, so nothing asked whether the reply hid it.
+    r"^\W{0,6}(?:[\w.'-]+ ){0,3}(?i:issues?|problems?|mismatch(?:es)?) +[1-9]",
     re.M,
 )
 
@@ -1872,6 +2081,7 @@ def compact_input(text: str) -> str:
 
 
 def compact_action(action: dict) -> dict:
+    action = strip_codex(action)
     result = compact_text(_SANDBOX_NOISE_LINE_RE.sub("", action["result"]))
     compacted = {**action, "input": compact_input(action["input"]), "result": result, "error": bool(action.get("error"))}
     # Jev is unreliable at counting. Give it the exact number of nonblank lines
@@ -1900,8 +2110,11 @@ def wire_action(action: dict) -> str:
 
 
 def wire_state(state: dict) -> dict:
-    """The state as Jev is sent it. The dict form stays for callout_key, build_reason and is_mechanics."""
-    return {**state, "actions": [wire_action(a) for a in state["actions"]]}
+    """The state as Jev is sent it. The dict form stays for callout_key, build_reason and is_mechanics.
+    An empty `conversation` or `earlier_actions` is left out: its key and brackets cost 4.5 tokens a call
+    that the evidence lines use instead."""
+    wired = {**state, "actions": [wire_action(a) for a in state["actions"]]}
+    return {k: v for k, v in wired.items() if v or k not in ("conversation", "earlier_actions")}
 
 
 def callout_target(action: dict) -> str:
@@ -2032,11 +2245,12 @@ def palter_targets(actions: list[dict]) -> list[int]:
 
 
 def held_entry(action: dict, evidence: tuple[set[str], set[str]]) -> tuple[int, dict]:
-    """(evidence hits, entry) for an action held only for its index: its input's first words and its
-    result's evidence lines, with the count of lines left out."""
+    """(evidence hits, entry) for an action held only for its index: its input's first words and the
+    pieces of it that check something, and its result's evidence lines, with the count of lines left out."""
     found = " | ".join(evidence_lines(action["result"], evidence, BRIEF_EVIDENCE_CHARS))
     short = {k: v for k, v in action.items() if k not in ("result_line_count", "rerun", "rerun_by")}
-    short.update(input=action_label(action, SIDE_EFFECT_CHARS), result=found,
+    label = action_label(action, SIDE_EFFECT_CHARS)
+    short.update(input=label + check_pieces(action["input"], label, HELD_CHECK_CHARS), result=found,
                  omitted_lines=sum(bool(line.strip()) for line in action["result"].splitlines()))
     return evidence_hits(short["input"] + "\n" + found, evidence), short
 
@@ -2055,7 +2269,7 @@ def build_state(
     claims = "\n".join(entries[i][1] for i in asked)
     evidence = evidence_terms(claims)
     stems = action_stems(claims)
-    per_sentence = [(evidence_terms(entries[i][1]), action_stems(entries[i][1])) for i in asked]
+    per_sentence = [(evidence_terms(entries[i][1]), action_stems(entries[i][1]), entries[i][1]) for i in asked]
     # A result that is only progress marks, read from a file an earlier pytest run wrote ("tail
     # out.txt" printing "...."), names no pytest itself.
     if any("pytest" in a["input"] for a in [*earlier, *actions]):
@@ -2084,10 +2298,16 @@ def build_state(
 
     # The person's task often opens the conversation too; it goes in once.
     messages = [m for m in conversation if not (m["role"] == "user" and task.strip() and m["text"].strip() == task.strip())]
+    # Each asked sentence's best action line is kept before older messages take their room: a message
+    # restating an earlier run ("both over the 0.65 bar", "206 of 210") was read as contradicting the
+    # newer result, which it had pushed out. Older assistant messages go in only for what no action shows.
+    best = earlier_lines(earlier + actions[:-1], evidence, stems, False, EARLIER_ACTIONS_TOKENS, per_sentence, only_sentences=True)
+    best_cost = sum(ITEM_OVERHEAD_TOKENS + estimate_tokens(line) for line in best)
+    message_room = OLDER_MESSAGES_TOKENS - min(OLDER_MESSAGES_TOKENS, best_cost * BEST_LINES_MESSAGE_SHARE)
     sentences = sentence_entries(summary)
     state = {
         "task": clip(task, TASK_CLIP_CHARS),
-        "conversation": conversation_lines(messages, evidence),
+        "conversation": conversation_lines(messages, unbacked(evidence, "\n".join([*best, *(a["input"] + "\n" + a["result"] for a in actions)])), message_room),
         "actions": [],
         "earlier_actions": [],
         "sentences": [clip(s, CANDIDATE_CLIP_CHARS if i in asked else SENTENCE_CLIP_CHARS) for i, s in enumerate(sentences)],
@@ -2105,7 +2325,7 @@ def build_state(
 
     side_effects = any(_NEGATIVE_RE.search(plain_markdown(entries[i][1])) for i in asked)
     room = budget - cost(state)
-    floor = EARLIER_FLOOR_TOKENS * scale
+    floor = max(EARLIER_FLOOR_TOKENS, best_cost) * scale
     reserve = estimate_tokens(earlier_lines(earlier, evidence, stems, side_effects, max(room, 0), per_sentence))
     whole = actions
     start_room = room
@@ -2202,6 +2422,9 @@ def build_state(
     # get no paltering questions. They have a floor of room the newest action cannot take.
     older = earlier + actions[: len(actions) - kept] + omitted
     state["earlier_actions"] = earlier_lines(older, evidence, stems, side_effects, max(room, floor), per_sentence)
+    change = rerun_change(whole[-1], earlier) if whole else None
+    if change:
+        state["earlier_actions"].append(change)
     return state, len(actions) - kept
 
 

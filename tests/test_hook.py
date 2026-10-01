@@ -540,7 +540,8 @@ class SizeTests(unittest.TestCase):
         action = hook.make_action("Bash", {"command": "npm test"}, "Exit code: 1\n2 failed\n41 passed", True)
         state, _ = hook.build_state("Fix it", [action], "Tests pass.")
         sent = hook.wire_state(state)
-        self.assertEqual(set(sent), {"task", "conversation", "actions", "earlier_actions", "sentences"})
+        # An empty conversation and earlier_actions are left out.
+        self.assertEqual(set(sent), {"task", "actions", "sentences"})
         self.assertEqual(sent["actions"], ['Bash (error): {"command": "npm test"}\n=> [3 lines] Exit code: 1\n2 failed\n41 passed'])
         self.assertLessEqual(hook.estimate_tokens(sent), hook.state_token_budget(1, 1))
 
@@ -609,9 +610,11 @@ class SizeTests(unittest.TestCase):
             {"role": "assistant", "text": "Working on it."},
         ]
         state, _ = hook.build_state("Fix it", [], "There are 1234 rows in `harness_runs`.", [], conversation)
-        texts = [m["text"] for m in state["conversation"]]
+        lines = state["conversation"]
+        self.assertTrue(all(isinstance(m, str) and m.split(": ", 1)[0] in ("user", "assistant") for m in lines), lines)
+        texts = [m.split(": ", 1)[1] for m in lines]
         self.assertNotIn("Fix it", texts)  # the task goes in once, as the task
-        self.assertEqual(texts[-1], "Working on it.")
+        self.assertEqual(lines[-1], "assistant: Working on it.")
         self.assertTrue(any("1234" in t for t in texts))  # an older reply that bears on the sentence
         self.assertFalse(any(t.startswith("Unrelated") for t in texts))
         self.assertTrue(all(len(t) <= hook.CONVERSATION_CLIP_CHARS + 40 for t in texts))
@@ -795,9 +798,11 @@ class ReviewFixTests(unittest.TestCase):
         with mock.patch.object(hook, "STATE_BASE_TOKENS", 0), mock.patch.object(hook, "STATE_PER_CANDIDATE_TOKENS", 50):
             state, _ = hook.build_state("task", [newest], "All 25 records have ids_match True.", earlier)
             self.assertTrue(any("records 25 ids_match True" in line for line in state["earlier_actions"]), state["earlier_actions"])
+            # The floor is at least the cost of each asked sentence's best line: with no fixed floor that
+            # line still goes in.
             with mock.patch.object(hook, "EARLIER_FLOOR_TOKENS", 0):
                 state, _ = hook.build_state("task", [newest], "All 25 records have ids_match True.", earlier)
-            self.assertEqual(state["earlier_actions"], [])
+            self.assertTrue(any("records 25 ids_match True" in line for line in state["earlier_actions"]), state["earlier_actions"])
 
     def held(self, scale=1.0, between=300):
         actions = [hook.make_action("Bash", {"command": "pytest -q tests/test_a.py"}, "FAILED tests/test_a.py::test_x\n1 failed", True)]
@@ -805,7 +810,10 @@ class ReviewFixTests(unittest.TestCase):
                     for i in range(between)]
         actions.append(hook.make_action("Bash", {"command": "echo done"}, "done", False))
         summary = "All tests pass in `tests/test_a.py`."
-        state, _ = hook.build_state("task", actions, summary, [], [], scale)
+        # A room that leaves space for held entries after the whole actions it fits (at 550 the sixth
+        # whole action takes all of it).
+        with mock.patch.object(hook, "STATE_BASE_TOKENS", hook.STATE_BASE_TOKENS - 10):
+            state, _ = hook.build_state("task", actions, summary, [], [], scale)
         return state, summary
 
     def test_held_actions_are_capped_and_runs_collapse(self):
@@ -1027,7 +1035,7 @@ class HookRunTests(unittest.TestCase):
         self.assertEqual(body["state"]["task"], "Fix the login bug and make sure the tests pass")
         sentences = ["Fixed the login bug.", "All tests are passing and the flow is solid."]
         self.assertEqual(body["state"]["sentences"], sentences)
-        self.assertEqual(set(body["state"]), {"task", "conversation", "actions", "earlier_actions", "sentences"})
+        self.assertEqual(set(body["state"]), {"task", "conversation", "actions", "sentences"})
         # Each sentence gets the questions its words call for; only the failed action is asked the paltering one.
         self.assertEqual(
             sorted(body["questions"]),
@@ -1043,7 +1051,7 @@ class HookRunTests(unittest.TestCase):
         )
         self.assertEqual(set(body["questions"]["unverified_action_s0"]["criteria"]), {"true", "false"})
         self.assertTrue(body["state"]["actions"][1].startswith("Bash (error): "))
-        self.assertEqual(body["state"]["earlier_actions"], [])  # the earlier Read bears on neither sentence
+        self.assertNotIn("earlier_actions", body["state"])  # the earlier Read bears on neither sentence, and an empty list is left out
         log = self.log_lines()[-1]
         self.assertFalse(log["redirected"])
         self.assertEqual(log["jev_model"], "jev-2026-09-15")
@@ -1460,6 +1468,115 @@ class SystemOneSchemaTests(unittest.TestCase):
         for body in bad:
             with self.subTest(body=body):
                 self.assertNotEqual(systemone_request_errors(body), [])
+
+
+class SelectionRuleTests(unittest.TestCase):
+    """Round 6: which evidence goes in at the same size."""
+
+    def test_codex_wrapper_and_header_are_stripped(self):
+        action = hook.make_action(
+            "exec", 'const r = await tools.exec_command({cmd:"deno task test","workdir":"/w","max_output_tokens":1000});\ntext(r.output);\n',
+            "Script completed\nWall time 1.1 seconds\nOutput:\n\n1248 passed | 0 failed\n", False)
+        stripped = hook.strip_codex(action)
+        self.assertEqual(stripped["input"], "deno task test  (in /w)")
+        self.assertEqual(stripped["result"], "1248 passed | 0 failed\n")
+        # A JSON result gives its output, with a nonzero exit code first.
+        action = hook.make_action("exec", "x", '{"output": "boom", "exit_code": 2, "wall_time_seconds": 0.1}', False)
+        self.assertEqual(hook.strip_codex(action)["result"], "[exit 2]\nboom")
+        # Anything else is left as it is.
+        plain = hook.make_action("Bash", {"command": "ls"}, "a\nb", False)
+        self.assertEqual(hook.strip_codex(plain), plain)
+
+    def test_a_clipped_input_keeps_its_check_pieces(self):
+        command = "for d in a b; do\n" + "\n".join(f"echo step {i} {'x' * 40}" for i in range(20)) + \
+            '\ncmp "$d/hook" repo/hook && echo "same: $d"\n' + "\n".join(f"echo after {i} {'y' * 40}" for i in range(20)) + "\ndone"
+        clipped = hook.clip_input(command, limit=300)
+        self.assertIn('cmp "$d/hook" repo/hook', clipped)
+        self.assertLess(len(clipped), len(command))
+
+    def test_older_lines_and_held_entries_carry_check_pieces(self):
+        script = "python - <<'PY'\nimport json\nsrc=[json.loads(x) for x in open('input.jsonl')]\n" + "x=1\n" * 40 + \
+            "assert len(src)==len(out)==25\nprint('validated')\nPY"
+        action = hook.make_action("Bash", {"command": script}, "validated", False)
+        self.assertIn("assert len(src)==len(out)==25", hook.one_line_action(action))
+        self.assertEqual(hook.check_pieces("ls -la\necho hi", "", 100), "")
+        _, short = hook.held_entry(action, (set(), set()))
+        self.assertIn("assert len(src)==len(out)==25", short["input"])
+
+    def test_counts_pair_with_their_nouns(self):
+        pairs = hook.count_pairs("All 40 of 40 offline unittest tests pass, and the 4 skipped ones are live.")
+        self.assertIn(("40", "test"), pairs)
+        self.assertFalse(any(n == "4" for n, _ in pairs))  # one-digit counts match too many lines
+        self.assertEqual(hook.counts_shown("Ran 40 tests in 32.475s\nOK", pairs), {"40"})
+        self.assertEqual(hook.counts_shown("40 ms elapsed", pairs), set())
+        # A label's value counts too; a time holding the number does not.
+        suites = hook.count_pairs("All 22 suites passed.")
+        self.assertEqual(hook.counts_shown("ok suites: 22", suites), {"22"})
+        self.assertEqual(hook.counts_shown("Sep 19 22:22:45 build suites done", suites), set())
+        # Numbers inside a hash or a path are no counts.
+        self.assertEqual(hook.count_pairs("Commit ddc7a27d is pushed."), frozenset())
+
+    def test_a_sentence_gets_the_run_that_prints_its_count(self):
+        sentence = "The 33 offline tests pass."
+        older = [
+            hook.make_action("Bash", {"command": "python3 -m unittest"}, "Ran 33 tests in 4.7s\n\nOK", False),
+            hook.make_action("Edit", {"file_path": "README.md", "old_string": "a", "new_string": "Run the 33 tests with unittest."}, "ok", False),
+        ] + [hook.make_action("Bash", {"command": f"cat notes_{i}.txt"}, "33 tests are described here " * 3, False) for i in range(6)]
+        entry = (hook.evidence_terms(sentence), hook.action_stems(sentence), sentence)
+        lines = hook.earlier_lines(older, entry[0], entry[1], False, 60, [entry], only_sentences=True)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("Ran 33 tests", lines[0])
+
+    def test_the_picked_line_leads_with_the_sentence_count(self):
+        result = "\n".join(f"compiling crate_{i} 0.{i}.0" for i in range(30)) + "\nok suites: 22\n" + \
+            "\n".join(f"warning line {i}" for i in range(30))
+        action = hook.make_action("Bash", {"command": "cat build.log"}, result, False)
+        sentence = "All 22 suites passed."
+        line = hook.one_line_action(action, hook.evidence_terms(sentence), hook.count_pairs(sentence), hook.evidence_terms(sentence))
+        self.assertIn("ok suites: 22", line)
+        self.assertNotIn("ok suites: 22", hook.one_line_action(action, (set(), set())))
+
+    def test_a_rerun_shows_what_changed(self):
+        earlier = [hook.make_action("Bash", {"command": "scan --status"}, "processed 3500 statuses\nclear: 2400\nat 12:00:01", False)]
+        newest = hook.make_action("Bash", {"command": "scan --status"}, "processed 3644 statuses\nclear: 2429\nat 12:09:44", False)
+        line = hook.rerun_change(newest, earlier)
+        self.assertIn("processed 3500 statuses -> processed 3644 statuses", line)
+        self.assertIn("clear: 2400 -> clear: 2429", line)
+        self.assertNotIn("12:09:44", line)  # times change on every run
+        other = hook.make_action("Bash", {"command": "scan --other"}, "processed 1 statuses", False)
+        self.assertIsNone(hook.rerun_change(other, earlier))
+        state, _ = hook.build_state("task", [newest], "It processed 3644 statuses.", earlier)
+        self.assertTrue(any("previous run vs this run" in line for line in state["earlier_actions"]), state["earlier_actions"])
+
+    def test_an_older_message_goes_in_only_for_what_no_action_shows(self):
+        earlier = [hook.make_action("Bash", {"command": "python3 -m unittest"}, "Ran 34 tests in 2s\n\nOK", False)]
+        conversation = [
+            {"role": "assistant", "text": "Earlier run: 30 of 34 tests passed."},
+            {"role": "user", "text": "keep going"},
+            {"role": "assistant", "text": "On it."},
+            {"role": "user", "text": "status?"},
+        ]
+        state, _ = hook.build_state("task", [], "All 34 tests pass.", earlier, conversation)
+        self.assertFalse(any("30 of 34" in m for m in state["conversation"]), state["conversation"])
+        self.assertTrue(any("Ran 34 tests" in line for line in state["earlier_actions"]))
+        # With no action showing 34, the older message backs the sentence.
+        state, _ = hook.build_state("task", [], "All 34 tests pass.", [], conversation)
+        self.assertTrue(any("30 of 34" in m for m in state["conversation"]), state["conversation"])
+        self.assertEqual(hook.unbacked(({"34", "5"}, {"a.py"}), "Ran 34 tests in a.py"), ({"5"}, set()))
+
+    def test_a_repeated_hook_message_goes_in_once(self):
+        note = "[hook] Stop checks ran; nothing flagged."
+        messages = [{"role": "user", "text": note}, {"role": "assistant", "text": "ok"}] * 3 + \
+            [{"role": "assistant", "text": "a"}, {"role": "user", "text": "b"}]
+        lines = hook.conversation_lines(messages)
+        self.assertEqual(sum(note in m for m in lines), 1, lines)
+
+    def test_a_check_script_reporting_an_issue_is_a_failure(self):
+        action = hook.make_action("Bash", "python check.py", "records 25 ids_match True\nentity span issue 1 'Aria Operations v8.18.6'", False)
+        self.assertTrue(hook.shows_failure(action))
+        for result in ("entity span issue 0", "no issues found", "issues: none"):
+            with self.subTest(result=result):
+                self.assertFalse(hook.shows_failure(hook.make_action("Bash", "python check.py", result, False)))
 
 
 if __name__ == "__main__":
