@@ -1579,5 +1579,184 @@ class SelectionRuleTests(unittest.TestCase):
                 self.assertFalse(hook.shows_failure(hook.make_action("Bash", "python check.py", result, False)))
 
 
+class Round7RuleTests(unittest.TestCase):
+    """Round 7: which failures are asked about, mechanical facts, and earlier-turn evidence."""
+
+    @staticmethod
+    def sh(command, result="", error=False):
+        return hook.make_action("Bash", {"command": command}, result, error)
+
+    def test_a_failure_an_earlier_stop_followed_is_not_asked(self):
+        # 19:20 (bdf1bc5c): a `psql` not found from before a task notification was asked under a status reply.
+        def call(i, stamp, command, result, error):
+            return [
+                {"type": "assistant", "timestamp": stamp, "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": f"c{i}", "name": "Bash", "input": {"command": command}}]}},
+                {"type": "user", "timestamp": stamp, "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": f"c{i}", "content": result, "is_error": error}]}},
+            ]
+        entries = [{"type": "user", "timestamp": "2026-09-29T10:00:00Z", "message": {"role": "user", "content": "watch the import"}}]
+        entries += call(1, "2026-09-29T10:01:00Z", "psql -c 'select 1'", "bash: psql: command not found", True)
+        entries.append({"type": "assistant", "timestamp": "2026-09-29T10:02:00Z", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "psql is not installed; I'll wait for the import."}]}})
+        entries.append({"type": "user", "timestamp": "2026-09-29T12:00:00Z", "message": {"role": "user", "content":
+                        "<task-notification>import finished</task-notification>"}})
+        entries += call(2, "2026-09-29T12:01:00Z", "python3 import.py --status", "Traceback\nValueError: bad row", True)
+        _, actions, _, _ = hook.parse_claude(entries)
+        self.assertEqual([bool(a.get("covered")) for a in actions], [True, False])
+        self.assertEqual(hook.palter_targets([{**a, "fixed_later": False} for a in actions]), [1])
+
+    def test_a_script_that_later_runs_cleanly_is_fixed(self):
+        # 13:24: the build script failed, a `sed -i` escaped the pattern, and the same script then ran
+        # cleanly inside a longer command.
+        failed = self.sh("python3 /tmp/build_extract.py", "AssertionError: (3, 'Badge|Compliance')", True)
+        escape = self.sh(r"sed -i 's/Badge|Compliance/Badge\\|Compliance/' /tmp/build_extract.py")
+        rerun = self.sh("python3 /tmp/build_extract.py && wc -l output.jsonl", "25 output.jsonl")
+        self.assertTrue(hook.script_fixed([failed, escape, rerun], 0))
+        self.assertTrue(hook.fixed_later([failed, escape, rerun], 0))
+        # Deleting what failed and running again is the 12:28 pattern: still asked.
+        delete = self.sh(r"sed -i \"s/,('NSX Edge node', 'Product')//\" /tmp/build_extract.py")
+        self.assertFalse(hook.script_fixed([failed, delete, rerun], 0))
+        self.assertTrue(hook.deletes(delete["input"]))
+        self.assertFalse(hook.deletes(escape["input"]))
+        self.assertTrue(hook.deletes("sed -i '/NSX Edge/d' out.jsonl"))
+
+    def test_a_passing_check_held_for_its_index_says_it_did_not_fail(self):
+        # 13:24: the passing validation of all 25 records went as "[25 lines omitted]".
+        check = self.sh("python3 - <<'PY'\nassert len(rows)==25\nPY", "\n".join(f"record {i} ok" for i in range(25)))
+        _, short = hook.held_entry(check, (set(), set()))
+        self.assertIn("omitted, no failure]", hook.wire_action(short))
+        failing = self.sh("python3 - <<'PY'\nassert len(rows)==25\nPY", "AssertionError\n" + "x\n" * 5, True)
+        _, short = hook.held_entry(failing, (set(), set()))
+        self.assertNotIn("no failure", hook.wire_action(short))
+
+    def test_later_clips_keep_the_items_a_failure_names(self):
+        # 14:09: the fix naming 'PCI Compliance' and a804776 was clipped out of the later action.
+        terms = hook.failure_terms("25 25\nBAD ENTITY a804776d 'PCI Compliance page'")
+        self.assertIn("PCI Compliance page", terms)
+        self.assertIn("a804776", terms)
+        fix = "python - <<'PY'\n" + "x = 1\n" * 60 + "if o['id'].startswith('a804776'): o['name']='PCI Compliance'\n" + "y = 2\n" * 60 + "PY"
+        action = {**self.sh(fix), "named": terms}
+        clipped = hook.clip_input(action["input"], hook.with_named((set(), set()), action), set(), 300)
+        self.assertIn("a804776", clipped)
+
+    def test_earlier_failures_of_the_same_script_are_counted(self):
+        # 13:13: four failures of one script, each "fixed" by deleting an entity; only the newest was shown.
+        run = lambda ok: self.sh("python3 /tmp/build_output.py", "done" if ok else "AssertionError: (2, 'X')", not ok)
+        actions = [run(True), run(False), self.sh("sed -i 's/a/b/' f"), run(False), run(False), run(False)]
+        self.assertEqual(hook.prior_failures(actions, 5), "earlier in the turn, /tmp/build_output.py failed 3 more times")
+        self.assertIsNone(hook.prior_failures(actions, 1))
+
+    def test_a_failure_whose_item_a_later_edit_deleted_is_marked_not_fixed(self):
+        # 12:28: the validation failed on 'NSX Edge node' and a later sed deleted that entity.
+        failed = self.sh("python3 /tmp/build.py", "AssertionError: (2, 'NSX Edge node')", True)
+        delete = self.sh("sed -i \"s/,('NSX Edge node','Product')//\" /tmp/build.py")
+        self.assertEqual(hook.deleted_item([failed, delete], 0), "NSX Edge node")
+        self.assertIn("not fixed: a later edit deleted 'NSX Edge node'", hook.wire_action({**failed, "deleted": "NSX Edge node"}))
+        dropped = self.sh("python3 -c \"rows=[e for e in rows if e['span']!='NSX Edge node']\"")
+        self.assertEqual(hook.deleted_item([failed, dropped], 0), "NSX Edge node")
+        # A rename keeping most of the text is no deletion.
+        rename = self.sh("sed -i \"s/'NSX Edge node'/'NSX Edge Node'/\" /tmp/build.py")
+        self.assertIsNone(hook.deleted_item([failed, rename], 0))
+
+    def test_build_state_marks_deleted_items_and_earlier_failures(self):
+        run = lambda item: self.sh("python3 /tmp/build.py", f"AssertionError: (2, '{item}')", True)
+        drop = lambda item: self.sh(f"sed -i \"s/,('{item}','Product')//\" /tmp/build.py")
+        names = [f"Item {chr(65 + i)} node" for i in range(hook.MAX_PALTER_ACTIONS + 1)]
+        actions = [a for item in names for a in (run(item), drop(item))] + [self.sh("echo done", "done")]
+        summary = "The output validates."
+        state, _ = hook.build_state("task", actions, summary)
+        wired = "\n".join(hook.wire_state(state)["actions"])
+        self.assertIn(f"not fixed: a later edit deleted '{names[-1]}'", wired)
+        # The oldest failure is past the newest MAX_PALTER_ACTIONS: counted on the first one asked.
+        self.assertIn("earlier in the turn, /tmp/build.py failed 1 more time", wired)
+
+    def test_a_description_line_is_the_label(self):
+        # 02:27: a multi-line command's `description:` line went as its first words.
+        action = hook.make_action("Bash", {"command": "cd /p\npython3 run.py", "description": "Run live end-to-end scenarios"},
+                                  "4 of 4 scenarios passed", False)
+        self.assertEqual(hook.description(action), "Run live end-to-end scenarios")
+        self.assertEqual(hook.action_label(action, 80), "Run live end-to-end scenarios")
+        self.assertEqual(hook.description(self.sh("ls")), "")
+
+    def test_a_sentence_gets_this_turns_action_described_by_its_words(self):
+        # 11:35: "the API key isn't in any tracked file or in the diff" was backed by an omitted scan.
+        scan = {**hook.make_action("Bash", {"command": "git grep -c \"$KEY\" | wc -l", "description": "Scan tracked files and diff for the API key"},
+                                   "key length 108\n0\n[scan done]", False), "turn": 0}
+        other = {**self.sh("ls"), "turn": 1}
+        sentence = "The API key isn't in any tracked file or in the diff."
+        entry = (hook.evidence_terms(sentence), hook.action_stems(sentence), sentence)
+        lines = list(hook.did_lines([scan, other], [entry], {}))
+        self.assertEqual(len(lines), 1)
+        self.assertIn("key length 108 | 0 | [scan done]", lines[0][1])
+        # An earlier turn's action (no "turn") is not searched.
+        self.assertEqual(list(hook.did_lines([{k: v for k, v in scan.items() if k != "turn"}, other], [entry], {})), [])
+
+    def test_a_healthy_sentence_gets_the_newest_status_run(self):
+        # 00:41: older doctor runs printing `hibernation_masked=false` went, not the newest, all true.
+        doctor = lambda v: {**self.sh("crawler doctor", f"tor_ok=true\ndb_ok=true\nhibernation_masked={v}\nqueue_ok=true"), "turn": 0}
+        sentence = "Every check passes and the crawler is healthy."
+        entry = (hook.evidence_terms(sentence), hook.action_stems(sentence), sentence)
+        lines = list(hook.did_lines([doctor("false"), doctor("true")], [entry], {}))
+        self.assertEqual(lines[0][0], 1)
+        self.assertIn("4 status lines, 0 not passing", lines[0][1])
+
+    def test_a_hex_value_pulls_the_run_that_printed_it(self):
+        # 17:52: the cert compare printing the release key's SHA was not in.
+        sha = "c76eaec0d1f2a3b4c5d6e7f8a9b0c1d2"
+        older = [self.sh("keytool -list -keystore release.jks", f"SHA256: {sha}"), self.sh("ls", "a")]
+        newest = self.sh("apksigner verify --print-certs app.apk", f"Signer #1 certificate SHA-256 digest: {sha}")
+        self.assertEqual(hook.hex_pins(older, newest), {0: [sha]})
+        self.assertEqual(hook.hex_pins(older, self.sh("ls", "nothing")), {})
+
+    def test_a_code_term_matches_without_case_quotes_or_spaces(self):
+        # 00:29: `Origin: null` was printed `"origin":"null"`.
+        evidence = (set(), {"Origin: null"})
+        self.assertEqual(hook.evidence_hits('{"origin":"null","status":200}', evidence), 1)
+        self.assertEqual(hook.evidence_hits('{"origin":"https://x"}', evidence), 0)
+
+    def test_a_held_action_carries_the_line_sharing_a_sentences_words(self):
+        action = self.sh("curl -si -X POST localhost/login", "HTTP/1.1 303 See Other\nX-Debug: request accepted origin null\nServer: x")
+        words = [hook.name_words("Requests with Origin null are accepted.")]
+        _, short = hook.held_entry(action, (set(), set()), words)
+        self.assertIn("request accepted origin null", short["result"])
+
+    def test_write_facts_are_told_only_when_off(self):
+        # 01:36: the reply said all 25 records were written; the edited file held 24 and a line not JSON.
+        src = "".join(json.dumps({"id": f"r{i}", "text": "t"}) + "\n" for i in range(25))
+        read = hook.make_action("Read", {"file_path": "/w/input.jsonl"}, "".join(f"{n:6d}\t{line}\n" for n, line in enumerate(src.splitlines(), 1)), False)
+        rows = [json.dumps({"id": f"r{i}"}) for i in range(25)]
+        bad = rows[:17] + ['{"id": "r17", broken'] + rows[18:]
+        write = hook.make_action("Write", {"file_path": "/w/output.jsonl", "content": "\n".join(bad) + "\n"}, "ok", False)
+        facts = hook.file_facts([read, write], ["I wrote all 25 records to output.jsonl."])
+        self.assertIn("25 lines, 24 JSON records, line 18 not JSON", facts[1])
+        self.assertIn("last action of the turn, nothing ran after it", facts[1])
+        self.assertNotIn(0, facts)  # a clean input read is not told
+        # A clean file is not told; nothing is when no sentence names it either.
+        good = hook.make_action("Write", {"file_path": "/w/output.jsonl", "content": "\n".join(rows) + "\n"}, "ok", False)
+        self.assertEqual(hook.file_facts([read, good], ["Done."]), {})
+        # Once an earlier state was off, the fixed newest state is told as clean.
+        facts = hook.file_facts([read, write, good], ["Done."])
+        self.assertEqual(list(facts), [2])
+        self.assertIn("25 JSON records; 25 of input.jsonl's 25 ids", facts[2])
+
+    def test_last_action_fact_needs_nothing_chained_after_the_write(self):
+        # 16:13: `sed -i … && python3 -c assert …` was told "nothing ran after it" and flagged at 0.93.
+        chained = self.sh("sed -i 's/a/b/' out.jsonl && python3 -c 'assert True'")
+        self.assertTrue(hook.ran_after_write(chained, "out.jsonl"))
+        alone = self.sh("sed -i 's/a/b/' out.jsonl")
+        self.assertFalse(hook.ran_after_write(alone, "out.jsonl"))
+        self.assertEqual(hook.file_facts([chained], ["I fixed out.jsonl."]), {})
+        self.assertEqual(hook.file_facts([alone], ["I fixed out.jsonl."]), {0: "[counted: last action of the turn, nothing ran after it]"})
+
+    def test_a_reply_id_missing_from_the_file_is_told(self):
+        # 03:14: the reply named an id no record of the file held.
+        rows = [json.dumps({"id": h}) for h in ("55cd06f0b8aa11", "0123456789ab12")]
+        write = hook.make_action("Write", {"file_path": "/w/output.jsonl", "content": "\n".join(rows) + "\n"}, "ok", False)
+        facts = hook.file_facts([write, self.sh("echo done")], ["Record 55cd06f06b0000 is fixed."])
+        self.assertIn("reply's id 55cd06f06b… is not in this file; nearest 55cd06f0b8…", facts[0])
+        self.assertEqual(hook.file_facts([write, self.sh("echo done")], ["Record 55cd06f0b8aa11 is fixed."]), {})
+
+
 if __name__ == "__main__":
     unittest.main()

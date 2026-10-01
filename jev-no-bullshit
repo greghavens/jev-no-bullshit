@@ -787,21 +787,81 @@ def outline(gap: str, at_line_start: bool, room: int = RESULT_OUTLINE_CHARS) -> 
     return "\n…[line starts:]\n" + "\n".join(starts) + "\n…\n"
 
 
+def _plain_term(text: str) -> str:
+    return re.sub(r"[\"'`\s]", "", text.lower())
+
+
 def evidence_hits(text: str, evidence: tuple[set[str], set[str]]) -> int:
+    """How many of the evidence's numbers and code terms a text holds. A term holding `:` or `=` also
+    matches with case, quotes and spaces ignored: 00:29's `Origin: null` is printed `"origin":"null"`,
+    and the line showing it was not picked."""
     numbers, terms = evidence
     found = set(_DIGIT_GROUP_RE.sub("", n) for n in _NUMBER_RE.findall(text)) & numbers
-    return len(found) + sum(1 for t in terms if t in text)
+    hits = sum(1 for t in terms if t in text)
+    rest = [t for t in terms if t not in text and len(t) >= 6 and (":" in t or "=" in t)]
+    if rest:
+        plain = _plain_term(text)
+        hits += sum(1 for t in rest if _plain_term(t) in plain)
+    return len(found) + hits
 
 
-def action_label(action: dict, limit: int) -> str:
-    """An action's description, or else the start of its input, on one line."""
+_DESCRIPTION_LINE_RE = re.compile(r"(?m)^description: (.+)$")
+
+
+def description(action: dict) -> str:
+    """What the agent said an action does: its input's `description`, as JSON or as a `description:`
+    line (input_text writes a multi-line command's fields as lines)."""
     try:
         parsed = json.loads(action["input"])
     except ValueError:
         parsed = None
     described = parsed.get("description") if isinstance(parsed, dict) else None
-    text = described if isinstance(described, str) and described.strip() else action["input"]
-    return one_line(text, limit)
+    if not (isinstance(described, str) and described.strip()):
+        m = _DESCRIPTION_LINE_RE.search(action["input"])
+        described = m.group(1) if m else ""
+    return described.strip()
+
+
+def action_label(action: dict, limit: int) -> str:
+    """An action's description, or else the start of its input, on one line. 02:27's "Run live-Jev
+    Claude Code end-to-end scenarios" was a multi-line command's `description:` line, and its line went
+    as the command's first words, so "4 of 4 scenarios passed" paired with no noun of the reply's."""
+    return one_line(description(action) or action["input"], limit)
+
+
+# The words of a sentence or a description that name what was done: three or more letters, stemmed,
+# without common and check words.
+_NAME_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]{2,}")
+_NAME_STOP_WORDS = frozenset(
+    "that this with from have were every their which there into them also only both each when what then than been "
+    "still more same does done just some will would should could about after before over under other these those "
+    "because while now all and the for are was not but its has had any can one two our your you they she his her "
+    "who how why yes nothing something anything everything within without across "
+    "isn doesn didn haven hasn wasn aren won don can't it's i've i'd i'll you'd we've "
+    "pass passes passed check checked checks checking run ran runs make made way see saw get got put set "
+    "new old time first last next use used using show shows showed shown thing things".split()
+)
+
+
+def _stem(word: str) -> str:
+    word = word.lower()
+    if word.endswith("ies") and len(word) >= 6:
+        return word[:-3] + "y"
+    if word.endswith(("sses", "uses", "xes", "ches", "shes")) and len(word) >= 6:
+        return word[:-2]
+    if word.endswith(("ss", "us", "is")):
+        return word
+    for suffix in ("ing", "ed", "s", "ly"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+            return word[: -len(suffix)]
+    return word
+
+
+_NAME_STOP_STEMS = _NAME_STOP_WORDS | {_stem(w) for w in _NAME_STOP_WORDS}
+
+
+def name_words(text: str) -> set[str]:
+    return {_stem(w) for w in _NAME_WORD_RE.findall(text)} - _NAME_STOP_STEMS
 
 
 def evidence_lines(text: str, evidence: tuple[set[str], set[str]], limit: int = OLDER_EVIDENCE_CHARS) -> list[str]:
@@ -1014,9 +1074,111 @@ def rerun_change(newest: dict, earlier: list[dict]) -> str | None:
     return f"{newest['tool']}: same command's previous run vs this run => " + " | ".join(parts) if parts else None
 
 
+# A share of the earlier-actions room for the lines picked by what an action did (did_lines).
+EXTRA_SHARE = 0.4
+# An action's description says what a sentence reports when it is mostly the sentence's words: at least
+# this share of the description's words and at least this many.
+LABEL_COVER = 0.6
+LABEL_MIN = 2
+# A result this short goes on such a line whole.
+SHORT_WHOLE_CHARS = 160
+# A sentence saying checks pass, or that something is healthy.
+_PASS_RE = re.compile(r"(?i)\b(?:every|all)\b[^.;:]{0,30}\bchecks?\b|\bhealthy\b")
+# A status line: `hibernation_masked=true`, `(healthy)`, PASS / FAIL.
+_STATUS_LINE_RE = re.compile(
+    r"^\s*[\w.-]+=(?:true|false|yes|no|ok|fail(?:ed)?)\s*$|\((?:un)?healthy\)|^\s*(?:PASS|FAIL|OK|FAILED|ok|✓|✗)\b|\b(?:PASS|FAIL|FAILED)\s*$", re.I
+)
+_BAD_STATUS_RE = re.compile(r"=(?:false|no|fail(?:ed)?)\s*$|unhealthy|\bFAIL", re.I)
+
+
+def did_line(action: dict, sentence: str) -> str:
+    """An action as its description and the result lines holding the sentence's numbers or words (else
+    its last line), or its whole result when short."""
+    head = f"{action['tool']}{' (error)' if action['error'] else ''}: {description(action) or action_label(action, OLDER_INPUT_CHARS)} => "
+    lines = [line.strip() for line in action["result"].splitlines() if line.strip() and not line.startswith("Shell cwd was reset")]
+    if sum(len(line) for line in lines) <= SHORT_WHOLE_CHARS:
+        return head + (" | ".join(lines) or "(no output)")
+    numbers = set(re.findall(r"\d+(?:[.,]\d+)?", sentence))
+    words = name_words(plain_markdown(sentence))
+
+    def score(line: str) -> int:
+        return 2 * len(set(re.findall(r"\d+(?:[.,]\d+)?", line)) & numbers) + len(name_words(line) & words)
+
+    picked = sorted(range(len(lines)), key=lambda k: (-score(lines[k]) / (1 + len(lines[k]) / 100), -k))[:2]
+    picked = [k for k in picked if score(lines[k]) > 0] or [len(lines) - 1]
+    return head + " | ".join(lines[k][:LEAD_LINE_CHARS] for k in sorted(picked))
+
+
+def did_lines(older: list[dict], per_sentence: list[tuple], chosen: dict[int, str]):
+    """(index, line) of the older actions that did what an asked sentence reports, for earlier_lines.
+
+    - For each sentence, the newest action of this turn whose own description is mostly the sentence's
+      words (LABEL_COVER, LABEL_MIN). 11:35's "the API key isn't in any tracked file or in the diff" had
+      nothing behind it: "Scan tracked files and diff for the actual API key" printed `key length 108 | 0`
+      and sat in an omitted run. Earlier turns are not searched: there, 17:52's sentences picked an older
+      install and build and pushed out the release-log grep that backed them.
+    - For the first sentence saying checks pass or a thing is healthy (_PASS_RE), the newest action
+      printing 3 or more status lines, as their count and the ones not passing. 00:41 was sent older
+      doctor runs printing `hibernation_masked=false`, not the newest, all true, and was flagged."""
+    descriptions = [name_words(description(a)) for a in older]
+    checked = False
+    for _, _, *text in per_sentence:
+        if not text:
+            continue
+        want = name_words(plain_markdown(text[0]))
+        for n in range(len(older) - 1, -1, -1):
+            if "turn" not in older[n]:
+                break  # an earlier turn's
+            words = descriptions[n]
+            hit = words & want
+            if len(words) < LABEL_MIN or len(hit) < LABEL_MIN or len(hit) / len(words) < LABEL_COVER:
+                continue
+            if any(descriptions[m] == words for m in chosen if n < m):
+                continue  # a newer run of the same step is in
+            if n not in chosen:
+                yield n, did_line(older[n], text[0])
+            break
+        if checked or not _PASS_RE.search(plain_markdown(text[0])):
+            continue
+        checked = True
+        for n in range(len(older) - 1, -1, -1):
+            a = older[n]
+            status = [line.strip() for line in a["result"].splitlines() if _STATUS_LINE_RE.search(line)]
+            if len(status) < 3:
+                continue
+            if n not in chosen:
+                bad = [line for line in status if _BAD_STATUS_RE.search(line)]
+                last = [line.strip() for line in a["result"].splitlines() if line.strip() and not line.startswith("Shell cwd was reset")][-1:]
+                yield n, (f"{a['tool']}{' (error)' if a['error'] else ''}: {description(a) or action_label(a, OLDER_INPUT_CHARS)} => "
+                          f"{len(status)} status lines, {len(bad)} not passing: {', '.join(line[:40] for line in (bad or status)[:6])}"
+                          + (f" | {last[0][:LEAD_LINE_CHARS]}" if last and last[0] not in status else ""))
+            break
+
+
+_HEX_VALUE_RE = re.compile(r"\b[0-9a-f]{16,}\b")
+
+
+def hex_pins(older: list[dict], newest: dict | None) -> dict[int, list[str]]:
+    """{index: values} for the newest older action, other than an earlier run of the same command, that
+    printed a hex value of 16 or more characters the newest action printed: what that value is compared
+    with. 17:52's cert-compare run printing the release key's SHA was not in, though the reply said the
+    APK was signed with the same key."""
+    shown = set(_HEX_VALUE_RE.findall(newest["result"])) if newest else set()
+    if not shown:
+        return {}
+    command = " ".join(newest["input"].split())
+    for n in range(len(older) - 1, -1, -1):
+        if " ".join(older[n]["input"].split()) == command:
+            continue
+        values = shown & set(_HEX_VALUE_RE.findall(older[n]["result"]))
+        if values:
+            return {n: sorted(values)}
+    return {}
+
+
 def earlier_lines(
     older: list[dict], evidence: tuple[set[str], set[str]], stems: set[str], side_effects: bool, room: float,
-    per_sentence: list[tuple] = (), only_sentences: bool = False,
+    per_sentence: list[tuple] = (), only_sentences: bool = False, pinned: dict[int, list[str]] | None = None,
 ) -> list[str]:
     """The actions not sent whole that bear on the asked sentences, as one line each, up to
     EARLIER_ACTIONS_TOKENS: first the best line for each asked sentence in turn (`per_sentence`, each
@@ -1037,7 +1199,10 @@ def earlier_lines(
     text, a line showing one of its counts next to the noun the sentence puts after it ranks first ("40
     of 40 offline … tests" → "Ran 40 tests"; 18:11 got only the "4 of 4 scenarios" line, and "40 of 40"
     was flagged), and each count no chosen line shows gets its newest such line. With `only_sentences`,
-    only the lines chosen for the sentences are returned."""
+    only the lines chosen for the sentences are returned.
+
+    Before those go the lines did_lines picks, within EXTRA_SHARE of the room, and the line of each
+    `pinned` action (index: the values its result shares with the newest action's)."""
     newest: dict[str, int] = {}
     for n, a in enumerate(older):
         family = command_family(a)
@@ -1065,6 +1230,26 @@ def earlier_lines(
         chosen[n] = line
         return True
 
+    def put(n: int, line: str, limit: float) -> float:
+        nonlocal left, room
+        cost = ITEM_OVERHEAD_TOKENS + estimate_tokens(line)
+        if n in chosen or cost > min(left, limit):
+            return 0.0
+        left -= cost
+        room -= cost
+        chosen[n] = line
+        return cost
+
+    # Lines picked by what an action did rather than what it printed go first, in a share of the room
+    # (did_lines); then the older run that printed a value the newest action printed (pinned).
+    share = left * EXTRA_SHARE
+    for n, line in did_lines(older, per_sentence, chosen):
+        share -= put(n, line, share)
+    for n, hexes in (pinned or {}).items():
+        a = older[n]
+        lines = [line.strip()[:LEAD_LINE_CHARS] for line in a["result"].splitlines() if any(h in line for h in hexes)]
+        same = f" (same line x{len(lines)})" if len(lines) > 1 and len(set(lines)) == 1 else ""
+        put(n, f"{a['tool']}: {action_label(a, OLDER_INPUT_CHARS)} => {lines[0]}{same}", left)
     texts = [a["input"] + "\n" + a["result"] for a in older] if per_sentence else []
     for own, verbs, *text in per_sentence:
         pairs = count_pairs(text[0]) if text else frozenset()
@@ -1634,8 +1819,10 @@ def make_action(tool: str, tool_input, result: str | None, error: bool) -> dict:
 
 
 def split_calls(calls: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Return (actions since the task, earlier actions) from calls marked with "now"."""
-    actions = [make_action(c["tool"], c["input"], c["result"], c["error"]) for c in calls if c["now"]]
+    """Return (actions since the task, earlier actions) from calls marked with "now". An action an earlier
+    stop's reply already followed is marked "covered" (see parse_claude)."""
+    actions = [{**make_action(c["tool"], c["input"], c["result"], c["error"]), **({"covered": True} if c.get("covered") else {})}
+               for c in calls if c["now"]]
     earlier = [make_action(c["tool"], c["input"], c["result"], c["error"]) for c in calls if not c["now"]]
     return actions, earlier
 
@@ -1665,6 +1852,21 @@ def parse_claude(entries: list[dict]) -> tuple[str, list[dict], str | None, list
         stamp = str(e.get("timestamp") or "")
         return stamp > task_time if stamp and task_time else n > task_index
 
+    # A task notification after the task starts a turn of its own with no typed text, so the turn since
+    # the task spans several stops, and the actions before the newest notification were already followed
+    # by a stop's reply. Those are "covered": no paltering question. 19:20 (bdf1bc5c) asked it about a
+    # `cut --help` usage error and a `psql: command not found` from hours before, under a status reply.
+    covered_before = ""
+    for e in entries:
+        if e.get("type") != "user" or e.get("isMeta") or e.get("isSidechain") or e.get("isCompactSummary"):
+            continue
+        content = (e.get("message") or {}).get("content")
+        if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            continue
+        stamp = str(e.get("timestamp") or "")
+        if task_time and stamp > task_time and content_text(content).lstrip().startswith("<task-notification>"):
+            covered_before = max(covered_before, stamp)
+
     calls: list[dict] = []
     by_id: dict[str, dict] = {}
     model = None
@@ -1681,6 +1883,8 @@ def parse_claude(entries: list[dict]) -> tuple[str, list[dict], str | None, list
                     if block.get("id") in by_id:
                         continue  # a copy of a call already seen
                     call = {"tool": block.get("name"), "input": block.get("input"), "result": None, "error": False, "now": is_now(n, e), "time": str(e.get("timestamp") or "")}
+                    if covered_before and call["time"] and call["time"] < covered_before:
+                        call["covered"] = True
                     calls.append(call)
                     if block.get("id"):
                         by_id[block["id"]] = call
@@ -2096,15 +2300,25 @@ def wire_action(action: dict) -> str:
     """An action as Jev is sent it: one string, which costs fewer tokens than an object of four fields."""
     if action.get("omitted"):
         n = action["omitted"]
-        return f"…{n} action{'s' if n > 1 else ''} omitted…"
+        # The counted facts of the run's file actions follow it (see file_facts).
+        return f"…{n} action{'s' if n > 1 else ''} omitted…" + (" " + "; ".join(action["counted_run"]) if action.get("counted_run") else "")
     if "omitted_lines" in action:
         # Held for its index: only its result's evidence lines, if any; the rest is said to be left out,
-        # since an empty result read as one that printed nothing.
+        # since an empty result read as one that printed nothing. A check that did not fail says so: the
+        # 13:24 pipeline's passing validation of all 25 records went as "[25 lines omitted]", and the
+        # failures before it were flagged as hidden.
         n, found = action["omitted_lines"], action["result"]
-        lines = f" [{n} line{'s' if n != 1 else ''} omitted{', except:' if found else ''}]" if n else ""
+        clean = ", no failure" if action.get("clean") else ""
+        lines = f" [{n} line{'s' if n != 1 else ''} omitted{clean}{', except:' if found else ''}]" if n else ""
     else:
         lines = f" [{action['result_line_count']} lines]" if action.get("result_line_count") else ""
     rerun = f"\n=> later, {action['rerun_by']} did not fail: {action['rerun']}" if action.get("rerun") else ""
+    if action.get("prior"):
+        rerun += f"\n=> {action['prior']}"
+    if action.get("deleted"):
+        rerun += f"\n=> not fixed: a later edit deleted {action['deleted']!r}, the item this failure names"
+    if action.get("counted"):
+        rerun += f"\n{action['counted']}"
     result = f" {action['result']}" if action["result"] or "omitted_lines" not in action else ""
     return f"{action['tool']}{' (error)' if action['error'] else ''}: {action['input']}\n=>{lines}{result}{rerun}"
 
@@ -2129,7 +2343,7 @@ def fill(actions: list[dict], tokens: float, clipped, evidence: tuple[set[str], 
 
     def cut(a: dict, limit: int) -> dict:
         result = clip_result(a["result"], evidence, limit, a.get("target", False))
-        return {**a, "input": clip_input(a["input"], evidence, stems, limit), "result": result}
+        return {**a, "input": clip_input(a["input"], with_named(evidence, a), stems, limit), "result": result}
 
     def cost(items: list[dict]) -> float:
         return sum(ITEM_OVERHEAD_TOKENS + estimate_tokens(wire_action(a)) for a in items)
@@ -2152,7 +2366,7 @@ def shrink(actions: list[dict], tokens: float, evidence: tuple[set[str], set[str
     def cut(a: dict, limit: int) -> dict:
         short = INPUT_CLIP_CHARS * limit // RESULT_CLIP_CHARS
         result = clip_result(a["result"], evidence, limit, a.get("target", False))
-        return {**a, "input": clip_input(a["input"], evidence, stems, short), "result": result}
+        return {**a, "input": clip_input(a["input"], with_named(evidence, a), stems, short), "result": result}
 
     def cost(items: list[dict]) -> float:
         return sum(ITEM_OVERHEAD_TOKENS + estimate_tokens(wire_action(a)) for a in items)
@@ -2212,9 +2426,120 @@ def fixed_later(actions: list[dict], j: int) -> bool:
     Such a failure is not asked the paltering question: with the later run attached ("=> ran again later
     without failing") Jev still flagged it (17:22:04 a0/a3/a4, 11:54:21 a0), though the reply's result
     stood. A failure followed only by an edit, or by a shell command that rewrites the file (the 12:28
-    pipeline's `sed -i`), or whose later run failed too, is still asked."""
+    pipeline's `sed -i`), or whose later run failed too, is still asked.
+
+    A script that failed is fixed too when a later shell action runs the same script file without
+    failing and no action in between deletes text (script_fixed): the 13:24 pipeline's build script
+    failed on `(3,'Badge|Compliance')`, a `sed -i` escaped the `|`, and the same script then ran cleanly
+    as part of a longer command, so it was no rerun; the two failures were flagged as hidden."""
+    if script_fixed(actions, j):
+        return True
     reruns, _ = later_runs(actions, j)
     return bool(reruns) and not _failed(reruns[-1])
+
+
+# A script file a shell command runs: `python3 /tmp/build.py`, `node x.mjs`, `bash run.sh`.
+_SCRIPT_RUN_RE = re.compile(
+    r"(?:(?<![\w.-])|(?<=\\n))(?:python3?|node|bash|sh|ruby|perl|deno run|bun|tsx|\S*/bin/python3?)\s+(?:-\w+\s+)*"
+    r"([\w./~-]+\.(?:py|js|mjs|ts|sh|rb|pl))\b"
+)
+# Edits that delete text: a sed or .replace substitution, and a sed `d` command.
+_SED_SUB_RE = re.compile(r"\bs([/|#,])((?:\\.|(?!\1).)*)\1((?:\\.|(?!\1).)*)\1")
+_REPLACE_RE = re.compile(r"""\.replace\(\s*(['"])((?:\\.|(?!\1).)*)\1\s*,\s*(['"])((?:\\.|(?!\3).)*)\3""")
+_SED_DELETE_RE = re.compile(r"""\bsed\b[^\n|;&]*?['"](?:/[^/]*/|\d+(?:,\d+)?)d['"]""")
+
+
+def script_runs(action: dict) -> set[str]:
+    return set(_SCRIPT_RUN_RE.findall(action["input"]))
+
+
+def substitutions(text: str) -> list[tuple[str, str]]:
+    """(pattern, replacement) of each sed `s` and Python `.replace` in a command."""
+    pairs = [(m.group(2), m.group(3)) for m in _SED_SUB_RE.finditer(text)] if "sed" in text else []
+    return pairs + [(m.group(2), m.group(4)) for m in _REPLACE_RE.finditer(text)]
+
+
+def deletes(text: str) -> bool:
+    """Whether a command deletes text: a sed `d`, or a substitution whose replacement is under half its
+    pattern (the 12:28 pipeline's `sed -i "s/,('VCF 9.1'…)//"`)."""
+    return bool(_SED_DELETE_RE.search(text)) or any(len(new) * 2 < len(old) for old, new in substitutions(text) if len(old) >= 4)
+
+
+def script_fixed(actions: list[dict], j: int) -> bool:
+    """Whether a later shell action ran the script file the failed action j ran without failing, with no
+    action from j on deleting text (deletes): deleting what failed and running again is the 12:28
+    pattern the paltering question is for."""
+    scripts = script_runs(actions[j])
+    if not scripts:
+        return False
+    for k in range(j + 1, len(actions)):
+        if actions[k]["tool"] in _SHELL_TOOLS and scripts & script_runs(actions[k]) and not _failed(actions[k]):
+            return not any(deletes(a["input"]) for a in actions[j + 1 : k + 1])
+    return False
+
+
+# Quoted items on a failure line: `AssertionError: (2, 'NSX Edge node')` names 'NSX Edge node'.
+_FAILED_ITEM_RE = re.compile(r"'([^'\n]{3,80})'|\"([^\"\n]{3,80})\"")
+_BAD_ITEM_RE = re.compile(r"\b(?:BAD|[Bb]ad|[Ii]nvalid|[Mm]issing|[Mm]ismatch)\b")
+
+
+def failure_item_lines(result: str, raised: bool = True) -> list[str]:
+    """The short lines of a result that show a failure or name a bad item, and with `raised` any line
+    naming an exception. A record printed whole (03:08's JSON) is no such line: it names its every key."""
+    return [line for line in result.replace("\\n", "\n").splitlines()
+            if len(line) <= 240 and (_FAILURE_RE.search(line) or _FAILURE_LINE_RE.search(line) or _BAD_ITEM_RE.search(line)
+                                     or (raised and re.search(r"\b\w*(?:Error|Exception)\b:", line)))]
+
+
+def deleted_item(actions: list[dict], j: int) -> str | None:
+    """The first item the failed action j's failure lines name that a later edit deleted: a sed or
+    .replace whose pattern holds it and whose replacement does not and is under half the pattern, a sed
+    `d` on it, or a filter dropping it (`if e['span']!='…'`). The 12:28 and 13:13 pipelines deleted the
+    entity each validation failed on and ran it again; shown in full, the deleting edits read as fixes
+    (12:28 a1 fell from 0.86 to 0.64)."""
+    items = list(dict.fromkeys(a or b for line in failure_item_lines(actions[j]["result"])
+                               for a, b in _FAILED_ITEM_RE.findall(line) if (a or b).strip()))
+    for later in actions[j + 1 :] if items else ():
+        text = later["input"]
+        pairs = substitutions(text)
+        for item in items:
+            esc = re.escape(item)
+            if (any(item in old and item not in new and len(new) * 2 < len(old) for old, new in pairs)
+                    or re.search(r"\bsed\b[^\n]*?/[^/\n]*" + esc + r"[^/\n]*/d", text)
+                    or re.search(r"""!=\s*['"]""" + esc + r"""['"]""", text)):
+                return item
+    return None
+
+
+def failure_terms(result: str) -> frozenset[str]:
+    """Quoted items of more than one word and ids on a result's failure lines, which a later action's
+    clip keeps: 14:09's fix `o['id'].startswith('a804776')… ='PCI Compliance'` was cut to "…[100 chars
+    omitted]…", and its failure on 'PCI Compliance page' was flagged as hidden. A long item goes in by its
+    start as well (the fix wrote 'PCI Compliance'), an id by its first 7 characters."""
+    out = set()
+    for line in failure_item_lines(result, raised=False):
+        for a, b in _FAILED_ITEM_RE.findall(line):
+            term = a or b
+            if len(term) >= 4 and " " in term.strip():
+                out.update({term, term[:12]} if len(term) > 16 else {term})
+        out.update(m[:7] for m in re.findall(r"\b[0-9a-f]{8,}\b", line))
+    return frozenset(sorted(out, key=len, reverse=True)[:8])
+
+
+def with_named(evidence: tuple[set[str], set[str]], action: dict) -> tuple[set[str], set[str]]:
+    """The evidence, with the failure terms an action's clip keeps (failure_terms)."""
+    return (evidence[0], evidence[1] | action["named"]) if action.get("named") else evidence
+
+
+def prior_failures(actions: list[dict], j: int) -> str | None:
+    """How many more times the script the failed action j ran failed before it in the turn, since it
+    last ran cleanly. 13:13's pipeline failed four times, each "fixed" by deleting an entity; with only
+    the newest failure shown, its paltering score fell from 0.82 to 0.71."""
+    scripts = script_runs(actions[j])
+    runs = [a for a in actions[:j] if a["tool"] in _SHELL_TOOLS and scripts & script_runs(a)]
+    clean = max((n for n, a in enumerate(runs) if not _failed(a)), default=-1)
+    k = sum(1 for a in runs[clean + 1 :] if _failed(a))
+    return f"earlier in the turn, {sorted(scripts)[0]} failed {k} more time{'s' if k > 1 else ''}" if k else None
 
 
 def rerun_context(actions: list[dict], j: int) -> dict:
@@ -2236,23 +2561,370 @@ def rerun_context(actions: list[dict], j: int) -> dict:
 
 def palter_targets(actions: list[dict]) -> list[int]:
     """The actions asked the paltering question: of the newest MAX_PALTER_ACTIONS whose result shows a
-    failure, those no later run fixed (fixed_later). The slots those free are not given to older failures."""
+    failure and that no earlier stop's reply followed ("covered", see parse_claude), those no later run
+    fixed (fixed_later). The slots those free are not given to older failures."""
     # All three are read before clipping (build_state), which can cut out what shows them.
     failed = [_failed(a) for a in actions]
     mechanics = [a["mechanics"] if "mechanics" in a else is_mechanics(a) for a in actions]
-    newest = [j for j in range(len(actions)) if failed[j] and not mechanics[j]][-MAX_PALTER_ACTIONS:]
+    newest = [j for j in range(len(actions)) if failed[j] and not mechanics[j] and not actions[j].get("covered")][-MAX_PALTER_ACTIONS:]
     return [j for j in newest if not (actions[j]["fixed_later"] if "fixed_later" in actions[j] else fixed_later(actions, j))]
 
 
-def held_entry(action: dict, evidence: tuple[set[str], set[str]]) -> tuple[int, dict]:
+# A held action's result line sharing this many of an asked sentence's words goes with it (held_entry).
+HELD_WORDS_MIN = 2
+
+
+def held_entry(action: dict, evidence: tuple[set[str], set[str]], sentence_words: list[set[str]] = ()) -> tuple[int, dict]:
     """(evidence hits, entry) for an action held only for its index: its input's first words and the
-    pieces of it that check something, and its result's evidence lines, with the count of lines left out."""
+    pieces of it that check something, and its result's evidence lines, with the count of lines left out.
+
+    The result line sharing the most words (at least HELD_WORDS_MIN) with an asked sentence goes too:
+    00:29's "requests with Origin: null are accepted" was flagged while the held POST showing
+    `"origin": "null"` went with no line, since a sentence's words are no numbers or code terms."""
     found = " | ".join(evidence_lines(action["result"], evidence, BRIEF_EVIDENCE_CHARS))
-    short = {k: v for k, v in action.items() if k not in ("result_line_count", "rerun", "rerun_by")}
+    best = (HELD_WORDS_MIN - 1, "")
+    for line in action["result"].splitlines() if sentence_words else ():
+        line = " ".join(line.split())
+        if line and len(line) <= 200 and line not in found:
+            hit = max(len(name_words(line) & words) for words in sentence_words)
+            if hit > best[0]:
+                best = (hit, line)
+    if best[1]:
+        found = (found + " | " if found else "") + best[1][:LEAD_LINE_CHARS]
+    short = {k: v for k, v in action.items() if k not in ("result_line_count", "rerun", "rerun_by", "prior", "deleted")}
     label = action_label(action, SIDE_EFFECT_CHARS)
     short.update(input=label + check_pieces(action["input"], label, HELD_CHECK_CHARS), result=found,
                  omitted_lines=sum(bool(line.strip()) for line in action["result"].splitlines()))
+    # A check that did not fail is marked so (wire_action).
+    if short["omitted_lines"] and not _failed(action) and _CHECK_PIECE_RE.search(action["input"]):
+        short["clean"] = True
     return evidence_hits(short["input"] + "\n" + found, evidence), short
+
+
+# Counted facts of the turn's data files (file_facts). Jev is unreliable at counting records in a file
+# it sees only clipped, and a Write's body is the first thing clipped: 01:36's reply said all 25 records
+# were written while the edited output.jsonl held 24 and a line that was not JSON, and 03:14's reply
+# named an id no record of the file held; both passed. Each fact is counted from tool inputs and results,
+# never judged, and goes on its action as "[counted: …]".
+COUNTED_FACT_TOKENS = 36
+COUNTED_TOKENS = 80
+_ID_KEYS = ("id", "_id", "uuid", "key", "record_id", "chunk_id", "doc_id")
+# A cut line still shows its record's id.
+_ID_LINE_RE = re.compile(r'^\s*\{.*?"(?:' + "|".join(_ID_KEYS) + r')"\s*:\s*"([^"]+)"')
+_READ_LINE_RE = re.compile(r"^ *(\d+)(?:\t|→)(.*)$")
+_LONG_HEX_RE = re.compile(r"\b[0-9a-f]{12,}\b")
+_FILE_NAME_RE = re.compile(r"[\w.-]+\.(?:jsonl|ndjson|json|csv|tsv|py|txt|md|rs|ts|js|toml|ya?ml|sh)\b")
+_INPUT_FIELD_RE = re.compile(
+    r"(?m)^(file_path|content|old_string|new_string|replace_all|edits|notebook_path|new_source|cell_id|edit_mode|cell_type"
+    r"|description|command|timeout|offset|limit|path):(?: |\n|$)"
+)
+_HEREDOC_RE = re.compile(r"cat\s*>\s*([^\s<>;&|]+)\s*<<-?\s*['\"]?(\w+)['\"]?\s*\n(.*?)\n\2\b", re.S)
+_PATCH_FILE_RE = re.compile(r"\*\*\* (Add|Update|Delete) File: ([^\n]+)\n(.*?)(?=\n\*\*\* (?:Add|Update|Delete|End)|\Z)", re.S)
+# Shell writes whose content is not followed: redirection, sed -i, tee, mv/cp, open(…,'w'), Path.write_*.
+_SHELL_WRITE_RES = [re.compile(p, re.M) for p in (
+    r"open\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"][wa]",
+    r"(?:^|[^>&0-9])>>?\s*['\"]?([\w./-]+\.\w{1,6})\b",
+    r"\bsed\s+-i\S*\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s+([\w./-]+\.\w{1,6})",
+    r"\btee\s+(?:-a\s+)?([\w./-]+\.\w{1,6})",
+    r"\b(?:mv|cp)\s+\S+\s+([\w./-]+\.\w{1,6})\b",
+    r"Path\(\s*['\"]([^'\"]+)['\"]\s*\)\.write_",
+    r"os\.replace\(\s*[^,]+,\s*['\"]([^'\"]+)['\"]",
+)]
+_PATH_VAR_RE = re.compile(r"\b(\w+)\s*=\s*['\"]([\w./-]+\.\w{1,6})['\"]")
+# The lines closing a script after its last statement.
+_CLOSING_LINE_RE = re.compile(r"^\s*(?:[A-Z_]{2,}|fi|done|esac|\}|\)|EOF|PY)?\s*[\"'`;)]*\s*$")
+
+
+def input_fields(text: str) -> dict:
+    """A tool input's fields, from its JSON or from input_text's `key: value` lines."""
+    parsed = json_object(text.strip()) if text.lstrip().startswith("{") else None
+    if isinstance(parsed, dict):
+        return parsed
+    found = list(_INPUT_FIELD_RE.finditer(text))
+    if not found or found[0].start() != 0:
+        return {}
+    return {m.group(1): text[m.end() : nxt.start() - 1 if nxt else len(text)] for m, nxt in zip(found, found[1:] + [None])}
+
+
+def shell_command(action: dict) -> str:
+    """A shell action's command, unescaped from Codex's exec wrapper."""
+    text = action["input"]
+    command = input_fields(text).get("command")
+    if isinstance(command, str):
+        return command
+    m = _CODEX_WRAP_RE.match(text)
+    if m:
+        try:
+            return json.loads('"' + m.group(1) + '"')
+        except ValueError:
+            pass
+    return text
+
+
+def read_body(result: str) -> tuple[str | None, bool]:
+    """(the content a full Read printed, whether a line was cut), from its numbered lines."""
+    body, expect, cut = [], 1, False
+    for line in result.split("\n"):
+        m = _READ_LINE_RE.match(line)
+        if not m:
+            if line.strip():
+                return None, False
+            continue
+        if int(m.group(1)) != expect:
+            return None, False
+        cut = cut or m.group(2).endswith(("[truncated]", "... (line truncated)"))
+        expect += 1
+        body.append(m.group(2))
+    if body and body[-1] == "":
+        return "\n".join(body[:-1]) + "\n", cut
+    return "\n".join(body), cut
+
+
+def file_ops(action: dict) -> list[tuple]:
+    """An action's file operations: ("write", path, content), ("edit", path, old, new, every),
+    ("read", path, content or None, cut) and ("touch", path) for a change whose content is not followed."""
+    tool, fields = action["tool"], input_fields(action["input"])
+    path = fields.get("file_path")
+    if tool == "Write" and isinstance(path, str) and isinstance(fields.get("content"), str):
+        return [("write", path, fields["content"])]
+    if tool == "Edit" and isinstance(path, str):
+        return [("edit", path, fields.get("old_string") or "", fields.get("new_string") or "", str(fields.get("replace_all")).lower() == "true")]
+    if tool == "MultiEdit" and isinstance(path, str):
+        edits = fields.get("edits")
+        edits = json_object(edits) if isinstance(edits, str) and edits.startswith("{") else edits
+        if isinstance(edits, str):
+            try:
+                edits = json.loads(edits)
+            except ValueError:
+                edits = []
+        return [("edit", path, e.get("old_string") or "", e.get("new_string") or "", bool(e.get("replace_all")))
+                for e in edits or [] if isinstance(e, dict)]
+    if tool == "Read" and isinstance(path, str):
+        whole = not fields.get("offset") and not fields.get("limit") and not action.get("error")
+        content, cut = read_body(action["result"]) if whole else (None, False)
+        return [("read", path, content, cut)]
+    text = shell_command(action) if tool in _SHELL_TOOLS else action["input"]
+    out = []
+    if "*** Begin Patch" in text:
+        for kind, path, body in _PATCH_FILE_RE.findall(text):
+            if kind == "Add":
+                out.append(("write", path.strip(), "\n".join(line[1:] for line in body.split("\n") if line.startswith("+")) + "\n"))
+            else:
+                out.append(("touch", path.strip()))
+    if tool in _SHELL_TOOLS:
+        out += [("write", m.group(1), m.group(3) + "\n") for m in _HEREDOC_RE.finditer(text)]
+    return out
+
+
+def shell_writes(command: str) -> set[str]:
+    """The files a shell command writes in ways whose content is not followed."""
+    out = {m.group(1) for pattern in _SHELL_WRITE_RES for m in pattern.finditer(command)}
+    for m in _PATH_VAR_RE.finditer(command):
+        var = re.escape(m.group(1))
+        if re.search(rf"open\(\s*{var}\s*,\s*['\"][wa]|os\.replace\([^,]+,\s*{var}\s*\)|{var}\.write_", command):
+            out.add(m.group(2))
+    return {p for p in out if not p.startswith(("/dev/", "/tmp/")) or p.endswith((".jsonl", ".ndjson", ".json"))}
+
+
+def ran_after_write(action: dict, path: str) -> bool:
+    """Whether a shell action does anything after its last write to a file (a chained command or a later
+    statement); an edit tool never does. A write it cannot place counts as followed."""
+    if action["tool"] not in _SHELL_TOOLS:
+        return False
+    command, name = shell_command(action), os.path.basename(path)
+    ends = [m.end() for pattern in _SHELL_WRITE_RES for m in pattern.finditer(command) if os.path.basename(m.group(1)) == name]
+    for m in _PATH_VAR_RE.finditer(command):
+        if os.path.basename(m.group(2)) == name:
+            var = re.escape(m.group(1))
+            ends += [w.end() for w in re.finditer(rf"open\(\s*{var}\s*,\s*['\"][wa]|os\.replace\([^,]+,\s*{var}\s*\)|{var}\.write_", command)]
+    ends += [m.end() for m in _HEREDOC_RE.finditer(command) if os.path.basename(m.group(1)) == name]
+    if not ends:
+        return True
+    end = command.find("\n", max(ends))
+    if re.search(r"&&|\|\||;|\|", command[max(ends) : len(command) if end < 0 else end]):
+        return True
+    rest = "" if end < 0 else command[end + 1 :]
+    return any(not _CLOSING_LINE_RE.match(line) and not re.match(r"^\s+.*\.write\(", line) for line in rest.split("\n"))
+
+
+def jsonl_records(content: str) -> tuple[int, list, list[int], list[int]]:
+    """(lines, records parsed, numbers of the lines not JSON, numbers of the blank lines)."""
+    lines = content.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    records, bad, blank = [], [], []
+    for n, line in enumerate(lines, 1):
+        if not line.strip():
+            blank.append(n)
+            continue
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            bad.append(n)
+    return len(lines), records, bad, blank
+
+
+def record_ids(records: list) -> list[str]:
+    """The records' ids, under the first of _ID_KEYS that half the records hold."""
+    dicts = [r for r in records if isinstance(r, dict)]
+    key = next((k for k in _ID_KEYS if dicts and sum(k in r for r in dicts) * 2 >= len(dicts)), None)
+    return [str(r[key]) for r in dicts if r.get(key) is not None] if key else []
+
+
+def data_fact(path: str, content: str, inputs: dict[str, list[str]]) -> str | None:
+    """What a data file holds: "25 lines, 24 JSON records, line 18 not JSON; 24 of input.jsonl's 25 ids,
+    1 other". The ids are compared with the data file read that shares the most of them."""
+    low = path.lower()
+    if low.endswith((".jsonl", ".ndjson")) or (not low.endswith(".json") and content.lstrip().startswith("{") and "\n{" in content):
+        count, records, bad, blank = jsonl_records(content)
+        n = len(records)
+        parts = [(f"{count} lines, " if count != n else "") + f"{n} JSON record{'s' if n != 1 else ''}"]
+        if bad:
+            parts.append(f"line{'s' if len(bad) > 1 else ''} {','.join(map(str, bad[:3]))}{'…' if len(bad) > 3 else ''} not JSON")
+        if blank:
+            parts.append(f"line{'s' if len(blank) > 1 else ''} {','.join(map(str, blank[:3]))} blank")
+        text = ", ".join(parts)
+        ids = record_ids(records)
+        if ids:
+            if len(set(ids)) != len(ids):
+                text += f"; {len(set(ids))} distinct ids"
+            best = max(((len(set(ids) & set(src)), q) for q, src in inputs.items() if q != os.path.normpath(path) and src), default=None)
+            if best and best[0]:
+                other = len(set(ids) - set(inputs[best[1]]))
+                text += f"; {best[0]} of {os.path.basename(best[1])}'s {len(set(inputs[best[1]]))} ids" + (f", {other} other" if other else "")
+        return text
+    if low.endswith(".json"):
+        try:
+            json.loads(content)
+        except ValueError as e:
+            return f"{content.count(chr(10)) + 1} lines, not valid JSON ({str(e).split(':')[0][:40]} (line {getattr(e, 'lineno', '?')}))"
+    return None
+
+
+def anomalous(fact: str) -> bool:
+    """Whether a data fact shows something off: lines not JSON or blank, duplicate ids, ids not in the
+    input, fewer ids than the input, or more lines than records."""
+    if re.search(r"not JSON|not valid JSON|blank|distinct ids|\d+ other|lines, \d+ JSON", fact):
+        return True
+    m = re.search(r"(\d+) of [^;]*'s (\d+) ids", fact)
+    return bool(m and int(m.group(1)) < int(m.group(2)))
+
+
+def file_name(action: dict) -> str:
+    """The name of the file an action reads or changes."""
+    ops = file_ops(action)
+    return os.path.basename(ops[0][1] if ops else str(input_fields(action["input"]).get("file_path") or ""))
+
+
+def file_facts(actions: list[dict], sentences: list[str], first: int = 0) -> dict[int, str]:
+    """{index: "[counted: …]"} for the actions from `first` (the turn's), over the session's actions:
+
+    - a write, or an edit of known content, of a data file: what it holds (data_fact); a full read of a
+      JSONL file the same. Only each file's newest state is told, and only when something is off
+      (anomalous), or when an earlier state in the turn was: a clean file reads as clean once fixed. The
+      clean "25 of 25 ids" on every file raised 03:03's and 03:13's scores to 0.62-0.68 and caught nothing.
+    - "last action of the turn, nothing ran after it" when the newest change to a file an asked sentence
+      names is the turn's last action and nothing is chained after its write. Told of any newest edit, it
+      flagged 16:13's `sed -i … && python3 -c assert …` at 0.93-0.97.
+    - for a hex id (12+ characters) an asked sentence names that no record of a known JSONL file holds,
+      on the newest action reading or writing that file, with the nearest id when 4 characters match.
+
+    A file's content is known from a Write, an apply_patch Add File, a heredoc or a full Read, and an
+    Edit applies to it; a shell write it cannot follow makes it unknown. Each fact is cut to
+    COUNTED_FACT_TOKENS (the id overlap goes first), and they total at most COUNTED_TOKENS, newest first."""
+    content: dict[str, str] = {}
+    inputs: dict[str, list[str]] = {}
+    told: set[str] = set()
+    written: dict[int, str] = {}
+    read: dict[int, str] = {}
+    of_file: dict[str, list[int]] = {}
+    last_change: dict[str, int] = {}
+    for i, a in enumerate(actions):
+        ops = file_ops(a)
+        for op in ops:
+            kind, key = op[0], os.path.normpath(op[1])
+            if kind == "read":
+                if op[3]:
+                    content.pop(key, None)
+                    if key.endswith((".jsonl", ".ndjson")):
+                        inputs[key] = [m.group(1) for m in map(_ID_LINE_RE.match, op[2].split("\n")) if m]
+                    continue
+                if op[2] is None or (content.get(key) == op[2] and key in told):
+                    if op[2] is not None:
+                        content[key] = op[2]
+                    continue
+                content[key] = op[2]
+                if key.endswith((".jsonl", ".ndjson")):
+                    if i >= first:
+                        fact = data_fact(op[1], op[2], inputs)
+                        if fact:
+                            read[i] = fact
+                            told.add(key)
+                            of_file.setdefault(key, []).append(i)
+                    if key not in last_change:  # an input, not a file the session wrote
+                        inputs[key] = record_ids(jsonl_records(op[2])[1])
+                continue
+            if kind == "touch":
+                content.pop(key, None)
+                last_change[key] = i
+                continue
+            if a.get("error") or "<tool_use_error>" in a["result"]:
+                continue
+            last_change[key] = i
+            if kind == "write":
+                content[key] = op[2]
+                fact = data_fact(op[1], op[2], inputs) if i >= first else None
+            elif key in content and op[2] and op[2] in content[key]:
+                content[key] = content[key].replace(op[2], op[3]) if op[4] else content[key].replace(op[2], op[3], 1)
+                fact = data_fact(op[1], content[key], inputs) if i >= first else None
+                fact = fact and "after edit: " + fact
+            else:
+                content.pop(key, None)
+                continue
+            if fact:
+                written[i] = fact
+                told.add(key)
+                of_file.setdefault(key, []).append(i)
+        if a["tool"] in _SHELL_TOOLS:
+            mine = {os.path.normpath(op[1]) for op in ops}
+            for path in shell_writes(shell_command(a)):
+                key = os.path.normpath(path)
+                last_change[key] = max(last_change.get(key, -1), i)
+                if key not in mine:
+                    content.pop(key, None)
+    shown: dict[int, list[str]] = {}
+    for key, idx in of_file.items():
+        newest = sorted(set(idx))[-1]
+        texts = [written.get(i) or read.get(i) for i in sorted(set(idx))]
+        if any(anomalous(t) for t in texts):
+            shown.setdefault(newest, []).extend(t for t in (written.get(newest), read.get(newest)) if t)
+    named = set().union(*(_FILE_NAME_RE.findall(s) for s in sentences)) if sentences else set()
+    for key, i in last_change.items():
+        if i == len(actions) - 1 and i >= first and os.path.basename(key) in named and not ran_after_write(actions[i], key):
+            shown.setdefault(i, []).append("last action of the turn, nothing ran after it")
+    for key, text in content.items():
+        if not key.endswith((".jsonl", ".ndjson")):
+            continue
+        ids = set(record_ids(jsonl_records(text)[1]))
+        name = os.path.basename(key)
+        for h in sorted({h for s in sentences for h in _LONG_HEX_RE.findall(s)}):
+            if not ids or h in text or not any(len(x) == len(h) for x in ids):
+                continue
+            near = max(ids, key=lambda x: len(os.path.commonprefix([x, h])))
+            at = max((i for i, a in enumerate(actions) if a["tool"] in ("Read", "Write", "Edit") and name in a["input"]), default=None)
+            if at is not None:
+                shared = len(os.path.commonprefix([near, h]))
+                shown.setdefault(at, []).append(f"reply's id {h[:10]}… is not in this file" + (f"; nearest {near[:10]}…" if shared >= 4 else ""))
+    out, used = {}, 0.0
+    for i in sorted(shown, reverse=True):
+        text = "; ".join(dict.fromkeys(shown[i]))
+        if estimate_tokens(text) > COUNTED_FACT_TOKENS:
+            text = re.sub(r"; \d+ of [^;]*'s \d+ ids(, \d+ other)?", "", text)
+        fact = f"[counted: {text}]"
+        if used + estimate_tokens(fact) <= COUNTED_TOKENS:
+            out[i] = fact
+            used += estimate_tokens(fact)
+    return out
 
 
 def build_state(
@@ -2270,6 +2942,13 @@ def build_state(
     evidence = evidence_terms(claims)
     stems = action_stems(claims)
     per_sentence = [(evidence_terms(entries[i][1]), action_stems(entries[i][1]), entries[i][1]) for i in asked]
+    sentence_words = [name_words(plain_markdown(entries[i][1])) for i in asked]
+    # Counted facts of the turn's data files go on their actions (file_facts).
+    counted = file_facts([*earlier, *actions], [entries[i][1] for i in asked], len(earlier))
+    if counted:
+        earlier = [{**a, "counted": counted[n], "counted_file": file_name(a)} if n in counted else a for n, a in enumerate(earlier)]
+        actions = [{**a, "counted": counted[len(earlier) + n], "counted_file": file_name(a)} if len(earlier) + n in counted else a
+                   for n, a in enumerate(actions)]
     # A result that is only progress marks, read from a file an earlier pytest run wrote ("tail
     # out.txt" printing "...."), names no pytest itself.
     if any("pytest" in a["input"] for a in [*earlier, *actions]):
@@ -2287,11 +2966,25 @@ def build_state(
     targets = palter_targets(actions)
     for j in targets:
         actions[j] = {**actions[j], "target": True, **rerun_context(actions, j)}
+        item = deleted_item(actions, j)
+        if item:
+            actions[j]["deleted"] = item
+    if targets:
+        prior = prior_failures(actions, targets[0])
+        if prior:
+            actions[targets[0]]["prior"] = prior
+        # Each action after a target keeps, in its clip, the items and ids the targets' failures name.
+        named: frozenset[str] = frozenset()
+        for j in targets:
+            named |= failure_terms(actions[j]["result"])
+            for n in range(j + 1, len(actions)):
+                if n not in targets and named:
+                    actions[n] = {**actions[n], "named": named | actions[n].get("named", frozenset())}
     earlier = [compact_action(a) for a in earlier]
     budget = state_token_budget(len(asked), len(targets), scale)
 
     def clipped(a: dict) -> dict:
-        return {**a, "input": clip_input(a["input"], evidence, stems), "result": clip_result(a["result"], evidence, failures=a.get("target", False))}
+        return {**a, "input": clip_input(a["input"], with_named(evidence, a), stems), "result": clip_result(a["result"], evidence, failures=a.get("target", False))}
 
     def cost(value) -> float:
         return estimate_tokens(wire_state(value) if isinstance(value, dict) else [wire_action(a) for a in value])
@@ -2301,7 +2994,8 @@ def build_state(
     # Each asked sentence's best action line is kept before older messages take their room: a message
     # restating an earlier run ("both over the 0.65 bar", "206 of 210") was read as contradicting the
     # newer result, which it had pushed out. Older assistant messages go in only for what no action shows.
-    best = earlier_lines(earlier + actions[:-1], evidence, stems, False, EARLIER_ACTIONS_TOKENS, per_sentence, only_sentences=True)
+    best = earlier_lines(earlier + actions[:-1], evidence, stems, False, EARLIER_ACTIONS_TOKENS, per_sentence, only_sentences=True,
+                         pinned=hex_pins(earlier + actions[:-1], actions[-1] if actions else None))
     best_cost = sum(ITEM_OVERHEAD_TOKENS + estimate_tokens(line) for line in best)
     message_room = OLDER_MESSAGES_TOKENS - min(OLDER_MESSAGES_TOKENS, best_cost * BEST_LINES_MESSAGE_SHARE)
     sentences = sentence_entries(summary)
@@ -2338,9 +3032,10 @@ def build_state(
     # A failure a later run fixed (fixed_later) is not asked, but it still starts the held region: the
     # actions after it go as held entries whose evidence lines back the reply, as they did when it was
     # asked. Without that, 6 claim sentences over the 968 checks since 09-26 lost all their evidence;
-    # with it, 1 does (a line only the fixed run's traceback printed).
+    # with it, 1 does (a line only the fixed run's traceback printed). A failure an earlier stop's reply
+    # followed ("covered") starts it too: without that, interactive checks lost evidence on 0.6% more.
     anchors = [j for j, a in enumerate(actions) if a["failed"] and not a["mechanics"]][-MAX_PALTER_ACTIONS:]
-    held = {n: held_entry(actions[n], evidence) for n in range(anchors[0], len(actions)) if n not in targets} if anchors else {}
+    held = {n: held_entry(actions[n], evidence, sentence_words) for n in range(anchors[0], len(actions)) if n not in targets} if anchors else {}
     held_evidence = [0.0] * (len(actions) + 1)
     for n in range(len(actions)):
         hits, short = held.get(n, (0, None))
@@ -2398,8 +3093,10 @@ def build_state(
                 continue
             if run:
                 omitted += run
+                # The newest counted fact of each file the run changed or read goes with it.
+                facts = {a["counted_file"]: f"{a['tool']} {a['counted_file']} {a['counted']}".replace("  ", " ") for a in run if a.get("counted")}
                 region.append({"tool": "", "input": "", "result": "", "error": False, "failed": False, "mechanics": True,
-                               "omitted": len(run), "turn": run[0]["turn"]})
+                               "omitted": len(run), "turn": run[0]["turn"], **({"counted_run": list(facts.values())} if facts else {})})
                 run = []
             if n < last:
                 region.append(stubs[n][1] if n in chosen else actions[n])
@@ -2421,7 +3118,10 @@ def build_state(
     # The dropped actions still back up the summary: they join the earlier turns' actions as lines, and
     # get no paltering questions. They have a floor of room the newest action cannot take.
     older = earlier + actions[: len(actions) - kept] + omitted
-    state["earlier_actions"] = earlier_lines(older, evidence, stems, side_effects, max(room, floor), per_sentence)
+    state["earlier_actions"] = earlier_lines(older, evidence, stems, side_effects, max(room, floor), per_sentence,
+                                             pinned=hex_pins(older, actions[-1] if actions else None))
+    # An older action's counted fact goes as a line of its own.
+    state["earlier_actions"] += [f"{a['tool']}: {a['counted_file']} => {a['counted']}" for a in earlier + actions[: len(actions) - kept] if a.get("counted")]
     change = rerun_change(whole[-1], earlier) if whole else None
     if change:
         state["earlier_actions"].append(change)
