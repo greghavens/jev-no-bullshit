@@ -1790,11 +1790,14 @@ class Round8RuleTests(unittest.TestCase):
         self.assertTrue(hook.anomalous(facts[1]))
         # Fewer than QUOTE_MISSES_MIN missing goes unsaid (00:21, 02:58), and a clean file is not told.
         two = ["the port 0 service", "port 1", "port 2", "port 3", "ports 4"]
-        self.assertEqual(hook.file_facts([read, self.write_output(two)], ["Done."]), {})
-        self.assertEqual(hook.file_facts([read, self.write_output(good)], ["Done."]), {})
+        copied = ["Spans are copied exactly."]
+        self.assertEqual(hook.file_facts([read, self.write_output(two)], copied), {})
+        self.assertEqual(hook.file_facts([read, self.write_output(good)], copied), {})
         # The span is looked for in the input record with the same id only.
         swapped = ["port 1", "port 2", "port 3", "port 0", "port 4"]
-        self.assertIn("4 of 10 quoted spans", hook.file_facts([read, self.write_output(swapped)], ["Done."])[1])
+        self.assertIn("4 of 10 quoted spans", hook.file_facts([read, self.write_output(swapped)], copied)[1])
+        # Unless an asked sentence says text was copied, the spans are not counted (03:14 named an id).
+        self.assertEqual(hook.file_facts([read, self.write_output(bad)], ["Done."]), {})
 
     def test_an_edit_is_checked_on_its_new_text(self):
         texts = [f"chunk {i} says the service listens on port {i}" for i in range(5)]
@@ -1804,9 +1807,55 @@ class Round8RuleTests(unittest.TestCase):
         new = json.dumps({"id": "r0", "entities": [{"name": "x", "span": "the port 0 service"}, {"name": "y", "span": "port zero"},
                                                    {"name": "z", "span": "the zero port"}], "claims": [{"evidence_span": "chunk 0"}]})
         edit = hook.make_action("Edit", {"file_path": "/w/output.jsonl", "old_string": old, "new_string": new}, "ok", False)
-        facts = hook.file_facts([read, write, edit], ["Fixed record r0."])
+        facts = hook.file_facts([read, write, edit], ["Fixed record r0; its spans are verbatim now."])
         self.assertIn("after edit: 3 of 4 quoted spans not in their record's input text", facts[2])
         self.assertEqual(hook.quote_fact([{"id": "r0", "span": "x"}], {}), None)  # no input record with its id
+
+    def test_copying_and_validity_sentences_are_told_apart(self):
+        copying = ["- **entities**: Named systems with their type, exact text span, and attributes",
+                   "All spans match the source text exactly.", "- Spans are copied character-for-character from the chunk",
+                   "- **claims**: Structured assertions with evidence spans extracted verbatim from the text",
+                   "- Only information explicitly stated in the text is included"]
+        plain = ["Done!", "- **id**: Copied unchanged from input", "- **keywords**: Up to 8 relevant terms",
+                 "I've extracted structured knowledge from all 25 chunks and written the results to `output.jsonl`.",
+                 "- Configuration procedures and API usage patterns"]
+        for s in copying:
+            with self.subTest(s=s):
+                self.assertTrue(hook._COPY_CLAIM_RE.search(s))
+        for s in plain:
+            with self.subTest(s=s):
+                self.assertFalse(hook._COPY_CLAIM_RE.search(s) or hook._VALID_CLAIM_RE.search(s))
+        for s in ("All 25 records now have valid JSON lines", "- Entity and claim types are validated against the ontology definitions",
+                  "All entity types conform to the ontology."):
+            with self.subTest(s=s):
+                self.assertTrue(hook._VALID_CLAIM_RE.search(s))
+
+    def test_a_span_count_alone_is_asked_of_the_copying_sentences(self):
+        # 00:01, 00:36, 03:08, 03:17: with "3 of 137 quoted spans not in …" in the state, every sentence was
+        # asked contradiction and nearly all flagged ("- **title**: Short heading for the chunk" 0.89).
+        texts = [f"chunk {i} says the service listens on port {i}" for i in range(5)]
+        read = self.read_input(texts)
+        bad = ["the port 0 service", "port 1", "port two", "the port 3 service", "ports 4"]
+        summary = ("Done! I've extracted all 5 chunks to `output.jsonl`.\n\n- **id**: Copied unchanged from input\n"
+                   "- **entities**: names with their exact text span\n\nAll records are valid JSON.")
+        state, _ = hook.build_state("task", [read, self.write_output(bad)], summary)
+        self.assertTrue(hook.spans_only(state))
+        questions, _, _ = hook.build_questions(state, summary)
+        contradiction = sorted(q for q in questions if q.startswith(hook.UNVERIFIED_CONTRADICTION))
+        self.assertEqual(contradiction, [f"{hook.UNVERIFIED_CONTRADICTION}_s3", f"{hook.UNVERIFIED_CONTRADICTION}_s4"])
+        self.assertIn(f"{hook.UNVERIFIED_ACTION}_s1", questions)  # the other questions are kept
+        # Another fact off (a line not JSON, 01:36) bears on every sentence: all are asked.
+        broken = self.write_output(bad)
+        broken["input"] = broken["input"].replace('{"id": "r2"', '{"id": "r2",', 1)
+        state, _ = hook.build_state("task", [read, broken], summary)
+        self.assertFalse(hook.spans_only(state))
+        questions, _, _ = hook.build_questions(state, summary)
+        self.assertIn(f"{hook.UNVERIFIED_CONTRADICTION}_s0", questions)
+        # No sentence saying text was copied: the spans are not counted, and every sentence is asked.
+        plain = "Done! I've extracted all 5 chunks to `output.jsonl`."
+        state, _ = hook.build_state("task", [read, self.write_output(bad)], plain)
+        self.assertFalse(hook.spans_only(state))
+        self.assertIn(f"{hook.UNVERIFIED_CONTRADICTION}_s0", hook.build_questions(state, plain)[0])
 
     def test_a_tests_pass_sentence_gets_the_newest_earlier_test_run(self):
         # 18:06: "All tests pass with it" was flagged; `Ran 40 tests … OK` was in an earlier turn.
