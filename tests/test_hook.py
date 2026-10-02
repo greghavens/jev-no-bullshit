@@ -702,6 +702,28 @@ class SizeTests(unittest.TestCase):
         hook.build_state("t", [hook.make_action("Bash", {"command": "npm test"}, "ok", False)], "Tests pass.")
         self.assertNotIn(text, hook._STRING_TOKENS)
 
+    def test_kept_piece_estimates_add_up_as_before_and_last_one_build(self):
+        # Pieces split as "[A-Z]?[a-z]+|[A-Z]+(?![a-z])|..." did, and their kept estimates add up, left to
+        # right, to the last bit of a loop estimating each piece; the next build starts with none kept.
+        old = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]|[ \t\n\r\f\v]+|[!-/:-@\[-`{-~]+|[^\x00-\x7f]")
+        text = "HTTPServer ran 40 tests; JSONLines OK — x=1.5e3 日本 \U0001f642 aB ABc a\tb\n\n{\"k\": [1, 2]}" * 3
+        self.assertEqual(hook._TOKEN_PIECE_RE.findall(text), old.findall(text))
+        total = 0.0
+        for piece in old.findall(text):
+            total += hook._piece_tokens(piece)
+        self.assertEqual(hook._text_tokens(text).hex(), total.hex())
+        self.assertIn("HTTP", hook._PIECE_TOKENS)
+        hook.build_state("t", [hook.make_action("Bash", {"command": "npm test"}, "ok", False)], "Tests pass.")
+        self.assertNotIn("HTTP", hook._PIECE_TOKENS)
+
+    def test_a_long_input_family_is_its_squeezed_start(self):
+        # A long input's family is read from its start only, and is the same as squeezing it whole.
+        for command in ("x" * 500, "a  " * 300, "echo " + "word " * 100, ("ls\n" * 50) + "y" * 400, " " * 390 + "abc " * 40,
+                        "python3 -c '" + "print(1); " * 60 + "'", "a" * 119 + " " + "b" * 400):
+            with self.subTest(command=command[:20]):
+                action = hook.make_action("Bash", {"command": command}, "", False)
+                self.assertEqual(hook.command_family(action), action["tool"] + "\0" + " ".join(action["input"].split())[:120])
+
     def test_shell_writes_skips_only_patterns_that_cannot_match(self):
         # A pattern is searched only when the command holds text it needs; the files found are the same
         # as searching every pattern.
@@ -1911,7 +1933,7 @@ class Round8RuleTests(unittest.TestCase):
         summary = ("Done! I've extracted all 5 chunks to `output.jsonl`.\n\n- **id**: Copied unchanged from input\n"
                    "- **entities**: names with their exact text span\n\nAll records are valid JSON.")
         state, _ = hook.build_state("task", [read, self.write_output(bad)], summary)
-        self.assertTrue(hook.spans_only(state))
+        self.assertTrue(hook.spans_only(hook.counted_facts(state)))
         questions, _, _ = hook.build_questions(state, summary)
         contradiction = sorted(q for q in questions if q.startswith(hook.UNVERIFIED_CONTRADICTION))
         self.assertEqual(contradiction, [f"{hook.UNVERIFIED_CONTRADICTION}_s3", f"{hook.UNVERIFIED_CONTRADICTION}_s4"])
@@ -1920,14 +1942,40 @@ class Round8RuleTests(unittest.TestCase):
         broken = self.write_output(bad)
         broken["input"] = broken["input"].replace('{"id": "r2"', '{"id": "r2",', 1)
         state, _ = hook.build_state("task", [read, broken], summary)
-        self.assertFalse(hook.spans_only(state))
+        self.assertFalse(hook.spans_only(hook.counted_facts(state)))
         questions, _, _ = hook.build_questions(state, summary)
         self.assertIn(f"{hook.UNVERIFIED_CONTRADICTION}_s0", questions)
         # No sentence saying text was copied: the spans are not counted, and every sentence is asked.
         plain = "Done! I've extracted all 5 chunks to `output.jsonl`."
         state, _ = hook.build_state("task", [read, self.write_output(bad)], plain)
-        self.assertFalse(hook.spans_only(state))
+        self.assertFalse(hook.spans_only(hook.counted_facts(state)))
         self.assertIn(f"{hook.UNVERIFIED_CONTRADICTION}_s0", hook.build_questions(state, plain)[0])
+
+    def test_a_line_not_json_is_not_asked_of_field_bullets(self):
+        # 01:36: with "line 18 not JSON" counted, "- **Titles**: Concise headings for each chunk's content"
+        # and "- **Keywords**: Up to 8 terms from each chunk" scored 0.93-0.95, though true of every record.
+        for s in ("- **Titles**: Concise headings for each chunk's content", "- **Keywords**: Up to 8 terms from each chunk",
+                  "- **title:** Short heading for the chunk", "* `keywords`: up to eight terms"):
+            with self.subTest(s=s):
+                self.assertTrue(hook.field_description(s))
+        for s in ("- **Claims**: Behavior and causes, each with evidence spans that directly support the claim",
+                  "- **Entities**: services and tools, all with exact character-for-character spans",
+                  "- **Format**: every line is valid JSON", "Perfect!", "- Titles are short headings",
+                  "What I checked, and how: - **Setup:** I ran the server on port 18088."):
+            with self.subTest(s=s):
+                self.assertFalse(hook.field_description(s))
+        read = self.read_input([f"chunk {i} says the service listens on port {i}" for i in range(5)])
+        summary = ("Perfect! I've extracted all 5 chunks to `output.jsonl`.\n\n- **Titles**: Concise headings for each chunk\n"
+                   "- **Claims**: each with evidence spans that support the claim")
+        broken = self.write_output([f"port {i}" for i in range(5)])
+        broken["input"] = broken["input"].replace('{"id": "r2"', '{"id": "r2",', 1)
+        state, _ = hook.build_state("task", [read, broken], summary)
+        questions, _, _ = hook.build_questions(state, summary)
+        contradiction = sorted(q for q in questions if q.startswith(hook.UNVERIFIED_CONTRADICTION))
+        self.assertEqual(contradiction, [f"{hook.UNVERIFIED_CONTRADICTION}_s{i}" for i in (0, 1, 3)])
+        # Nothing counted off: the field bullet is asked as before.
+        state, _ = hook.build_state("task", [read, self.write_output([f"port {i}" for i in range(5)])], summary)
+        self.assertIn(f"{hook.UNVERIFIED_CONTRADICTION}_s2", hook.build_questions(state, summary)[0])
 
     def test_a_tests_pass_sentence_gets_the_newest_earlier_test_run(self):
         # 18:06: "All tests pass with it" was flagged; `Ran 40 tests … OK` was in an earlier turn.

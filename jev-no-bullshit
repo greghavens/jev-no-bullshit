@@ -21,8 +21,10 @@ action being {"tool", "input", "result", "error"} and each conversation message
 from __future__ import annotations
 
 import datetime as _dt
+import functools
 import hashlib
 import json
+import operator
 import os
 import re
 import sys
@@ -808,8 +810,12 @@ def evidence_hits(text: str, evidence: tuple[set[str], set[str]], held: tuple[se
     `Origin: null` is printed `"origin":"null"`, and the line showing it was not picked."""
     numbers, terms = evidence
     found = (held[0] if held and held[0] is not None else number_set(text)) & numbers if numbers else set()
-    hits = sum(1 for t in terms if t in text)
-    rest = [t for t in terms if t not in text and len(t) >= 6 and (":" in t or "=" in t)]
+    hits, rest = 0, []
+    for t in terms:  # each term is searched for once: a result can be long
+        if t in text:
+            hits += 1
+        elif len(t) >= 6 and (":" in t or "=" in t):
+            rest.append(t)
     if rest:
         plain = held[1] if held and held[1] is not None else _plain_term(text)
         hits += sum(1 for t in rest if _plain_term(t) in plain)
@@ -915,7 +921,8 @@ def one_line_action(
     head = f"{action['tool']}{' (error)' if action['error'] else ''}: {label} => "
     lead = []
     if own is not None:
-        lead = [" ".join(line.split())[:LEAD_LINE_CHARS] for line in action["result"].splitlines() if pairs and counts_shown(line, pairs)][:1]
+        shows = next((line for line in action["result"].splitlines() if counts_shown(line, pairs)), None) if pairs else None
+        lead = [" ".join(shows.split())[:LEAD_LINE_CHARS]] if shows is not None else []
         lead += [line for line in evidence_lines(action["result"], own, LEAD_LINE_CHARS) if line[:LEAD_LINE_CHARS] not in lead]
         lead = [line for line in lead if line not in end]
     room = OLDER_EVIDENCE_CHARS - sum(len(line) for line in lead)
@@ -939,12 +946,24 @@ def relevant(action: dict, evidence: tuple[set[str], set[str]], stems: set[str])
     return relevance(action, evidence, stems) > 0
 
 
+# How much of an input's start command_family reads first.
+FAMILY_SCAN_CHARS = 400
+
+
 def command_family(action: dict) -> str | None:
     """What makes two shell actions the same command run again: the tool and the start of the input.
     A monitoring script run every ten minutes is one family; `cat a.txt` and `cat b.txt` are two."""
     if action["tool"] not in _SHELL_TOOLS:
         return None
-    return action["tool"] + "\0" + " ".join(action["input"].split())[:120]
+    text = action["input"]
+    if len(text) > FAMILY_SCAN_CHARS:
+        # The first 120 characters of the input with its spaces squeezed, read from its start: the words
+        # before the last one, which the cut may split, are whole. Splitting a long script whole took 2%
+        # of build time.
+        words = text[:FAMILY_SCAN_CHARS].split()[:-1]
+        if sum(map(len, words)) + len(words) - 1 >= 120:
+            return action["tool"] + "\0" + " ".join(words)[:120]
+    return action["tool"] + "\0" + " ".join(text.split())[:120]
 
 
 # Pieces of an input that check something. Kept in a clipped input and after an older action's label.
@@ -1027,17 +1046,18 @@ def count_pairs(sentence: str) -> frozenset[tuple[str, str]]:
     return frozenset(pairs)
 
 
-def counts_shown(text: str, pairs: frozenset[tuple[str, str]]) -> set[str]:
+def counts_shown(text: str, pairs: frozenset[tuple[str, str]], lowered=None) -> set[str]:
     """The numbers of `pairs` the text shows followed within two words by their noun ("Ran 40 tests"),
     or right after it as a label's value ("suites: 22"; 17:52's "all 22 suites passed" got a line whose
-    only 22 was in a date, "Sep 19 22:22:45")."""
+    only 22 was in a date, "Sep 19 22:22:45"). `lowered`, when given, returns the text lowercased, kept
+    by the caller for the next pairs."""
     # A match starts where the number or the noun does, so each pattern is tried only there, and a text
     # holding neither is not searched: searched whole every time, a session of 9,491 entries spent 15 of
     # its 30 seconds here.
     pairs = [(n, noun) for n, noun in pairs if n in text]
     if not pairs:
         return set()
-    low, shown = text.lower(), set()
+    low, shown = lowered() if lowered else text.lower(), set()
     for n, noun in pairs:
         if n in shown or noun not in low:
             continue
@@ -1174,7 +1194,7 @@ def test_run_line(older: list[dict], chosen: dict[int, str]):
         return
 
 
-def did_lines(older: list[dict], per_sentence: list[tuple], chosen: dict[int, str]):
+def did_lines(older: list[dict], per_sentence: list[tuple], chosen: dict[int, str], memo: dict | None = None):
     """(index, line) of the older actions that did what an asked sentence reports, for earlier_lines.
 
     - For each sentence, the newest action of this turn whose own description is mostly the sentence's
@@ -1186,8 +1206,19 @@ def did_lines(older: list[dict], per_sentence: list[tuple], chosen: dict[int, st
       printing 3 or more status lines, as their count and the ones not passing. 00:41 was sent older
       doctor runs printing `hibernation_masked=false`, not the newest, all true, and was flagged.
     - For the first sentence saying tests pass with no count in it, the newest older test run's summary
-      (test_run_line), from any turn."""
-    descriptions = [name_words(description(a)) for a in older]
+      (test_run_line), from any turn.
+
+    An action's description words are found only when compared, and kept in `memo` (earlier_lines'):
+    found for every older action, they took 8% of the slowest session's build."""
+    memo = {} if memo is None else memo
+
+    def described(n: int) -> set[str]:
+        a = older[n]
+        hit = memo.get(("words", id(a)))
+        if not (hit and hit[0] is a):
+            hit = memo[("words", id(a))] = (a, name_words(description(a)))
+        return hit[1]
+
     checked = False
     tested = False
     for _, _, *text in per_sentence:
@@ -1200,11 +1231,11 @@ def did_lines(older: list[dict], per_sentence: list[tuple], chosen: dict[int, st
         for n in range(len(older) - 1, -1, -1):
             if "turn" not in older[n]:
                 break  # an earlier turn's
-            words = descriptions[n]
+            words = described(n)
             hit = words & want
             if len(words) < LABEL_MIN or len(hit) < LABEL_MIN or len(hit) / len(words) < LABEL_COVER:
                 continue
-            if any(descriptions[m] == words for m in chosen if n < m):
+            if any(described(m) == words for m in chosen if n < m):
                 continue  # a newer run of the same step is in
             if n not in chosen:
                 yield n, did_line(older[n], text[0])
@@ -1324,7 +1355,7 @@ def earlier_lines(
     # Lines picked by what an action did rather than what it printed go first, in a share of the room
     # (did_lines); then the older run that printed a value the newest action printed (pinned).
     share = left * EXTRA_SHARE
-    for n, line in did_lines(older, per_sentence, chosen):
+    for n, line in did_lines(older, per_sentence, chosen, memo):
         share -= put(n, line, share)
     for n, hexes in (pinned or {}).items():
         a = older[n]
@@ -1342,8 +1373,28 @@ def earlier_lines(
         hit = memo.get(key)
         if not (hit and hit[0] is a):
             result, text = _LINE_NUMBER_RE.sub("", a["result"]), a["input"] + "\n" + a["result"]
-            hit = memo[key] = (a, result, text, held_by(result, numbered, plain), held_by(text, numbered, plain), a["input"].lower())
+            held = held_by(result, numbered, plain)
+            if numbered and result == a["result"]:
+                # A number never spans the newline between input and result, so the text's numbers are
+                # the input's and the result's, and the result is not searched twice.
+                held_text = (number_set(a["input"]) | held[0], _plain_term(text) if plain else None)
+            else:
+                held_text = held_by(text, numbered, plain)
+            hit = memo[key] = (a, result, text, held, held_text, a["input"].lower())
         return hit
+
+    def lowered(a: dict, text: str, whole: bool):
+        """For counts_shown: a function returning `text`, the action's result (or with `whole` its input and
+        result), lowercased, found once for all the sentences."""
+
+        def low() -> str:
+            key = ("lower", id(a), whole)
+            hit = memo.get(key)
+            if not (hit and hit[0] is a):
+                hit = memo[key] = (a, text.lower())
+            return hit[1]
+
+        return low
 
     seen = [look(a) for a in older] if per_sentence else []
     texts = [s[2] for s in seen]
@@ -1355,16 +1406,20 @@ def earlier_lines(
         # file read's line numbers ("25→") are no evidence. Last, the most of the sentence's verbs its
         # input spells; an action showing none of the rest ranks below all that do and is never taken,
         # so it is left out.
+        # Each sentence's ranks are kept by action, in a table of their own.
+        ranks = memo.get(("rank", id(entry)))
+        if not (ranks and ranks[0] is entry):
+            ranks = memo[("rank", id(entry))] = (entry, {})
+        ranks = ranks[1]
         ranked = []
         for n, (a, result, t, held_result, held_text, low) in enumerate(seen):
-            key = ("rank", id(a), id(entry))
-            hit = memo.get(key)
-            if not (hit and hit[0] is a and hit[1] is entry):
-                rank = ((len(counts_shown(a["result"], pairs)), len(counts_shown(t, pairs))) if pairs else (0, 0)) + (
-                    evidence_hits(result, own, held_result), evidence_hits(t, own, held_text))
-                hit = memo[key] = (a, entry, (*rank, rank[3] + sum(1 for stem in verbs if stem in low)) if any(rank) else None)
-            if hit[2]:
-                ranked.append((*hit[2], n))
+            hit = ranks.get(id(a))
+            if not (hit and hit[0] is a):
+                rank = ((len(counts_shown(a["result"], pairs, lowered(a, a["result"], False))), len(counts_shown(t, pairs, lowered(a, t, True))))
+                        if pairs else (0, 0)) + (evidence_hits(result, own, held_result), evidence_hits(t, own, held_text))
+                hit = ranks[id(a)] = (a, (*rank, rank[3] + sum(1 for stem in verbs if stem in low)) if any(rank) else None)
+            if hit[1]:
+                ranked.append((*hit[1], n))
         ranked.sort(key=lambda p: tuple(-x for x in p))
         for *_, hits, _, n in ranked:
             if not hits or take(n, pairs, own):
@@ -1372,12 +1427,17 @@ def earlier_lines(
         wanted = {n for n, _ in pairs} - set().union(*(counts_shown(line, pairs) for line in chosen.values()))
         for count in sorted(wanted):
             mine = frozenset(p for p in pairs if p[0] == count)
-            n = next((n for n in range(len(texts) - 1, -1, -1) if count in texts[n] and counts_shown(texts[n], mine)), None)
+            n = next((n for n in range(len(texts) - 1, -1, -1)
+                      if count in texts[n] and counts_shown(texts[n], mine, lowered(seen[n][0], texts[n], True))), None)
             if n is not None:
                 take(n, pairs, own)
     if only_sentences:
         return list(chosen.values())
-    scored = [(relevance(a, evidence, stems, seen[n][4] if seen else None), n) for n, a in enumerate(older)]
+    if seen:  # relevance, from the text and lowercased input look found
+        scored = [(evidence_hits(t, evidence, held_text) + sum(1 for stem in stems if stem in low), n)
+                  for n, (_, _, t, _, held_text, low) in enumerate(seen)]
+    else:
+        scored = [(relevance(a, evidence, stems), n) for n, a in enumerate(older)]
     for hits, n in sorted(((h, n) for h, n in scored if h), key=lambda p: (-p[0], -p[1])):
         take(n)
     if side_effects:
@@ -1904,7 +1964,8 @@ _PYTEST_MARKS = {".": "passed", "F": "failed", "E": "errors", "s": "skipped", "x
 
 def plain_result(result: str, input_text_: str = "") -> str:
     """A result with tool shorthand written out."""
-    result = _RG_LONG_LINE_RE.sub(r"\1\2:[line \2 matches; it is too long to print]", result)
+    if ":[Omitted long matching line]" in result:  # searched only where it can match: most results are not rg's
+        result = _RG_LONG_LINE_RE.sub(r"\1\2:[line \2 matches; it is too long to print]", result)
     if "pytest" in input_text_ or "pytest" in result:
         result = with_pytest_counts(result)
     return result
@@ -2282,7 +2343,8 @@ def read_transcript(path: str | None, parse) -> tuple[str, list[dict], str | Non
 # fitted to Qwen3.5's counts on real tool calls. Other characters use Jev's measured counts: 1 for each
 # in the Basic Multilingual Plane (accents, dashes, CJK), 2 above it (emoji). On states of 30 or more
 # strings the estimate lands within 10% of the true count (median 1.01x), and within 4% on the live API.
-_TOKEN_PIECE_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]|[ \t\n\r\f\v]+|[!-/:-@\[-`{-~]+|[^\x00-\x7f]")
+# Written so a capital is read once: "[A-Z]?[a-z]+|[A-Z]+(?![a-z])" splits text the same, 12% slower.
+_TOKEN_PIECE_RE = re.compile(r"[a-z]+|[A-Z](?:[a-z]+|[A-Z]*(?![a-z]))|[0-9]|[ \t\n\r\f\v]+|[!-/:-@\[-`{-~]+|[^\x00-\x7f]")
 SHORT_WORD_TOKENS = 1.13  # a letter piece of up to 3 letters
 LONG_WORD_TOKENS_PER_LETTER = 0.17
 DIGIT_TOKENS = 1.0
@@ -2303,6 +2365,18 @@ RETRY_BUDGET_SCALE = 0.8
 _STRING_TOKENS: dict[str, float] = {}
 
 
+class _PieceTokens(dict):
+    """Each piece's estimate, found when first asked (_piece_tokens) and kept for one build (build_state
+    clears it): most pieces are the same few words and marks."""
+
+    def __missing__(self, piece: str) -> float:
+        tokens = self[piece] = _piece_tokens(piece)
+        return tokens
+
+
+_PIECE_TOKENS = _PieceTokens()
+
+
 def estimate_tokens(value) -> float:
     """Estimate Jev's token count for a state value, the way Jev renders objects."""
     if isinstance(value, dict):
@@ -2320,20 +2394,22 @@ def estimate_tokens(value) -> float:
 
 
 def _text_tokens(text: str) -> float:
-    tokens = 0.0
-    for piece in _TOKEN_PIECE_RE.findall(text):
-        first = piece[0]
-        if not first.isascii():
-            tokens += ASTRAL_CHAR_TOKENS if ord(first) > 0xFFFF else BMP_CHAR_TOKENS
-        elif first.isalpha():
-            tokens += SHORT_WORD_TOKENS if len(piece) <= 3 else LONG_WORD_TOKENS_PER_LETTER * len(piece)
-        elif first.isdigit():
-            tokens += DIGIT_TOKENS
-        elif first.isspace():
-            tokens += WHITESPACE_RUN_TOKENS
-        else:
-            tokens += PUNCTUATION_TOKENS_PER_CHAR * len(piece)
-    return tokens
+    # Added left to right from 0.0, as a loop of `+=` does: sum() adds floats with compensation, which can
+    # change the last bit and so a fit decided on it.
+    return functools.reduce(operator.add, map(_PIECE_TOKENS.__getitem__, _TOKEN_PIECE_RE.findall(text)), 0.0)
+
+
+def _piece_tokens(piece: str) -> float:
+    first = piece[0]
+    if not first.isascii():
+        return ASTRAL_CHAR_TOKENS if ord(first) > 0xFFFF else BMP_CHAR_TOKENS
+    if first.isalpha():
+        return SHORT_WORD_TOKENS if len(piece) <= 3 else LONG_WORD_TOKENS_PER_LETTER * len(piece)
+    if first.isdigit():
+        return DIGIT_TOKENS
+    if first.isspace():
+        return WHITESPACE_RUN_TOKENS
+    return PUNCTUATION_TOKENS_PER_CHAR * len(piece)
 
 
 def question_tokens(question: dict) -> float:
@@ -2391,8 +2467,15 @@ def _dump_lines(value, indent: str = "") -> str:
     return _dump(value)
 
 
+# A line that may open a JSON value: after a gutter or not, its first nonblank character is `{` or `[`.
+# A text with no such line holds no JSON compact_text rewrites.
+_JSON_START_LINE_RE = re.compile(r"(?m)^(?: *\d+\t)?[ \t\r]*[{\[]")
+
+
 def compact_text(text: str) -> str:
     """Text with its JSON rewritten compactly: one JSON value (read with line numbers or not), or JSON lines."""
+    if not _JSON_START_LINE_RE.search(text):
+        return text
     lines = text.split("\n")
     gutters = [_GUTTER_RE.match(line) for line in lines]
     numbered = len(lines) > 1 and all(g or not line.strip() for g, line in zip(gutters, lines))
@@ -2420,7 +2503,9 @@ def compact_action(action: dict) -> dict:
     compacted = {**action, "input": compact_input(action["input"]), "result": result, "error": bool(action.get("error"))}
     # Jev is unreliable at counting. Give it the exact number of nonblank lines
     # before any clipping, without assuming that a line is a match or a record.
-    lines = sum(bool(line.strip()) for line in compacted["result"].splitlines())
+    # Counted without a loop: a line is blank when empty or all whitespace, the characters strip takes.
+    split = compacted["result"].splitlines()
+    lines = len(split) - split.count("") - sum(map(str.isspace, split))
     if lines > 1:
         compacted["result_line_count"] = lines
     return compacted
@@ -3241,6 +3326,7 @@ def build_state(
     about: its numbers, code terms or action verbs (see evidence_terms, earlier_lines).
     """
     _STRING_TOKENS.clear()
+    _PIECE_TOKENS.clear()
     entries = sentences_with_headings(summary)
     asked = candidates(summary)
     claims = "\n".join(entries[i][1] for i in asked)
@@ -3452,16 +3538,36 @@ _COUNTED_RE = re.compile(r"\[counted: ([^\]]*)\]")
 _QUOTE_COUNT_RE = re.compile(r"\d+ of \d+ quoted spans not in their record's input text")
 
 
-def spans_only(state: dict) -> bool:
-    """Whether the state's counted facts find copied spans missing from their input (quote_fact) and nothing
-    else off: no line that is not JSON, no id missing or extra, no reply's id absent from the file."""
+def counted_facts(state: dict) -> list[str]:
+    """The state's counted facts ("[counted: …]"), on this turn's actions and the earlier ones."""
     lines = [*(a.get("counted") or "" for a in state["actions"]), *("; ".join(a.get("counted_run") or ()) for a in state["actions"]),
              *state["earlier_actions"]]
-    facts = [m for line in lines for m in _COUNTED_RE.findall(line)]
+    return [m for line in lines for m in _COUNTED_RE.findall(line)]
+
+
+def spans_only(facts: list[str]) -> bool:
+    """Whether the counted facts find copied spans missing from their input (quote_fact) and nothing
+    else off: no line that is not JSON, no id missing or extra, no reply's id absent from the file."""
     if not any(_QUOTE_COUNT_RE.search(f) for f in facts):
         return False
     rest = [p for f in facts for p in _QUOTE_COUNT_RE.sub("", f).split("; ")]
     return not any(anomalous(p) or " not in " in p for p in rest)
+
+
+# A bullet that names an output field and says what it holds: "- **Titles**: Concise headings for each
+# chunk's content". With a line counted not JSON, 01:36's "Titles" and "Keywords: Up to 8 terms from each
+# chunk" bullets scored 0.93-0.95 on contradiction, Jev reading the whole file as failed, though both were
+# true of every record that parsed; the "Entities … exact character-for-character spans" and "Claims …
+# each with evidence spans that directly support the claim" bullets beside them were true flags. Such a
+# bullet is asked whether a result contradicts it only when it speaks of spans, quotes or evidence, or of
+# the output being valid (_VALID_CLAIM_RE), which is what the counted facts check.
+_FIELD_BULLET_RE = re.compile(r"^[-*+]\s+(?:\*\*|__)?`?\w[\w ]{0,24}`?(?:\*\*|__)?\s*:(?:\*\*|__)?\s")
+_SPAN_WORD_RE = re.compile(r"(?i)\b(?:spans?|quot(?:e|es|ed)|evidence|excerpts?|verbatim)\b")
+
+
+def field_description(sentence: str) -> bool:
+    """Whether a sentence is a bullet describing an output field that says nothing of copied text or validity."""
+    return bool(_FIELD_BULLET_RE.match(sentence)) and not (_SPAN_WORD_RE.search(sentence) or _VALID_CLAIM_RE.search(sentence))
 
 
 def build_questions(state: dict, summary: str, scale: float = 1.0) -> tuple[dict, int, int]:
@@ -3471,16 +3577,21 @@ def build_questions(state: dict, summary: str, scale: float = 1.0) -> tuple[dict
     its heading); each action whose result shows a failure (palter_targets) gets the paltering question.
     When the only thing the counted facts find off is copied spans missing from their input (spans_only),
     contradiction is asked only of the sentences saying text was copied or the output is valid or was
-    corrected as a whole (_COPY_CLAIM_RE, _VALID_CLAIM_RE).
+    corrected as a whole (_COPY_CLAIM_RE, _VALID_CLAIM_RE); when they find anything off, it is not asked
+    of the bullets that only describe an output field (field_description).
     Paltering questions for the oldest actions go first, then sentence questions from the end.
     """
     questions = {}
     entries = sentence_entries(summary)
-    copying = spans_only(state)
+    facts = counted_facts(state)
+    copying = spans_only(facts)
+    defect = any(anomalous(p) for f in facts for p in f.split("; "))
     for i in candidates(summary):
         if i < len(state["sentences"]):
             for t in route(entries[i]):
                 if copying and t == UNVERIFIED_CONTRADICTION and not (_COPY_CLAIM_RE.search(entries[i]) or _VALID_CLAIM_RE.search(entries[i])):
+                    continue
+                if defect and t == UNVERIFIED_CONTRADICTION and field_description(entries[i]):
                     continue
                 questions[f"{t}_s{i}"] = make_question(t, i)
     palter_ids = [f"{PALTER}_a{j}" for j in palter_targets(state["actions"])]
