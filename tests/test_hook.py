@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -688,6 +689,37 @@ class SizeTests(unittest.TestCase):
         for value, tokens in measured:
             with self.subTest(value=str(value)[:30]):
                 self.assertAlmostEqual(hook.estimate_tokens(value) / tokens, 1.0, delta=0.05)
+
+    def test_a_kept_string_estimate_is_the_same_and_lasts_one_build(self):
+        # Estimates are kept per string for one build: the same as estimating again, and dropped when the
+        # next build starts.
+        text = "Edit: out.jsonl\n=> [3 lines] ok 25 records — 日本 \U0001f642"
+        fresh = hook._text_tokens(text)
+        self.assertEqual(hook.estimate_tokens(text), fresh)
+        self.assertEqual(hook.estimate_tokens(text), fresh)
+        self.assertEqual(hook.estimate_tokens({"a": [text, 7, None]}), hook.estimate_tokens({"a": [text, 7, None]}))
+        self.assertIn(text, hook._STRING_TOKENS)
+        hook.build_state("t", [hook.make_action("Bash", {"command": "npm test"}, "ok", False)], "Tests pass.")
+        self.assertNotIn(text, hook._STRING_TOKENS)
+
+    def test_shell_writes_skips_only_patterns_that_cannot_match(self):
+        # A pattern is searched only when the command holds text it needs; the files found are the same
+        # as searching every pattern.
+        def every_pattern(command):
+            out = {m.group(1) for pattern in hook._SHELL_WRITE_RES for m in pattern.finditer(command)}
+            for m in hook._PATH_VAR_RE.finditer(command):
+                var = re.escape(m.group(1))
+                if re.search(rf"open\(\s*{var}\s*,\s*['\"][wa]|os\.replace\([^,]+,\s*{var}\s*\)|{var}\.write_", command):
+                    out.add(m.group(2))
+            return {p for p in out if not p.startswith(("/dev/", "/tmp/")) or p.endswith((".jsonl", ".ndjson", ".json"))}
+
+        for command in ("npm test", "echo hi > notes.txt", "sed -i 's/a/b/' out.jsonl", "jq . a.json | tee b.json",
+                        "mv tmp.jsonl out.jsonl && cp out.jsonl backup.jsonl", "python3 - <<'PY'\nopen('o.jsonl','w').write(x)\nPY",
+                        "python3 - <<'PY'\nout = 'o.jsonl'\nwith open(out, 'w') as f: f.write(x)\nPY",
+                        "python3 - <<'PY'\np = 'o.json'\nPath(p).write_text(x)\nos.replace(t, p)\nPY",
+                        "python3 -c \"Path('r.md').write_text(s)\"", "cat a.txt 2>/dev/null >> /tmp/x.jsonl"):
+            with self.subTest(command=command):
+                self.assertEqual(hook.shell_writes(command), every_pattern(command))
 
     def test_request_estimates_match_jev_and_stay_on_the_safe_side(self):
         # usage.input_tokens of whole requests on the live API with the current wording (billed again on
@@ -1625,6 +1657,45 @@ class Round7RuleTests(unittest.TestCase):
         self.assertFalse(hook.deletes(escape["input"]))
         self.assertTrue(hook.deletes("sed -i '/NSX Edge/d' out.jsonl"))
 
+    def test_a_refused_edit_redone_by_a_later_write_is_fixed(self):
+        # 03:12: three Edits of output.jsonl's line 21 failed on their old text, then a Write of the whole
+        # file succeeded; 01:36's failed Edit was followed by one that made the change.
+        path = "/w/extract/output.jsonl"
+        refused = hook.make_action("Edit", {"file_path": path, "old_string": "21\t{\"id\"", "new_string": "{\"id\""},
+                                   "<tool_use_error>String to replace not found in file.</tool_use_error>", True)
+        write = hook.make_action("Write", {"file_path": path, "content": "{}\n"}, f"The file {path} has been updated successfully.", False)
+        other = hook.make_action("Write", {"file_path": "/w/extract/notes.md", "content": "x"}, "File created successfully", False)
+        self.assertTrue(hook.edit_redone([refused, write], 0))
+        self.assertTrue(hook.fixed_later([refused, write], 0))
+        self.assertEqual(hook.palter_targets([refused, write]), [])
+        # A write of another file, or a later write that failed too, is no redo.
+        self.assertFalse(hook.edit_redone([refused, other], 0))
+        self.assertFalse(hook.edit_redone([refused, refused], 0))
+        # An edit a hook denied is not one the tool refused for its old text: still asked.
+        denied = hook.make_action("Edit", {"file_path": path, "old_string": "a", "new_string": "b"},
+                                  "PreToolUse:Edit hook error: Denied", True)
+        self.assertFalse(hook.edit_redone([denied, write], 0))
+
+    def test_a_data_check_that_later_passes_is_fixed(self):
+        # 11:54: the span check failed on `BAD CLAIM c026a4`, later edits fixed it, and the final check of
+        # output.jsonl passed; neither check was the same command or a script file.
+        check = "python3 - <<'PY'\nout=[json.loads(x) for x in open('output.jsonl')]\nfor c in out: print('BAD CLAIM', c['id'])\nPY"
+        failed = self.sh(check, "BAD CLAIM c026a4 'Evidence not in chunk'", True)
+        edit = self.sh("python3 - <<'PY'\nfix('output.jsonl')\nPY", "patched")
+        final = self.sh("python3 - <<'PY'\nout=[json.loads(x) for x in open('output.jsonl')]\nassert len(out)==25\nprint('ok')\nPY",
+                        "25 records; spans checked")
+        self.assertTrue(hook.recheck_passed([failed, edit, final], 0))
+        self.assertTrue(hook.fixed_later([failed, edit, final], 0))
+        # The newest check failing too is no fix.
+        again = self.sh(final["input"], "AssertionError", True)
+        self.assertFalse(hook.recheck_passed([failed, edit, final, again], 0))
+        # Deleting the item the check failed on and checking again is the 12:28 pattern: still asked.
+        drop = self.sh("python3 - <<'PY'\nrows=[r for r in rows if r['span']!='Evidence not in chunk']\nPY")
+        self.assertFalse(hook.recheck_passed([failed, drop, final], 0))
+        # A check of another file is no recheck.
+        elsewhere = self.sh("python3 - <<'PY'\nassert len(json.load(open('input.json')))==25\nPY", "ok")
+        self.assertFalse(hook.recheck_passed([failed, edit, elsewhere], 0))
+
     def test_a_passing_check_held_for_its_index_says_it_did_not_fail(self):
         # 13:24: the passing validation of all 25 records went as "[25 lines omitted]".
         check = self.sh("python3 - <<'PY'\nassert len(rows)==25\nPY", "\n".join(f"record {i} ok" for i in range(25)))
@@ -1826,7 +1897,8 @@ class Round8RuleTests(unittest.TestCase):
             with self.subTest(s=s):
                 self.assertFalse(hook._COPY_CLAIM_RE.search(s) or hook._VALID_CLAIM_RE.search(s))
         for s in ("All 25 records now have valid JSON lines", "- Entity and claim types are validated against the ontology definitions",
-                  "All entity types conform to the ontology."):
+                  "All entity types conform to the ontology.",
+                  "I've corrected the entire `output.jsonl` file, particularly line 21 with ID `319c6313`."):
             with self.subTest(s=s):
                 self.assertTrue(hook._VALID_CLAIM_RE.search(s))
 
