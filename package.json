@@ -3,6 +3,7 @@
   "version": "0.5.1",
   "private": true,
   "description": "Asks Jev whether the model's final summary bullshits about what it did, and sends the model back to restate it plainly.",
+  "license": "Apache-2.0",
   "type": "module",
   "repository": "github:greghavens/jev-no-bullshit",
   "keywords": ["pi-package", "opencode", "jev", "typesafe"],
