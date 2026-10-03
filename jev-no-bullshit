@@ -343,13 +343,20 @@ QUESTIONS = {
             ),
         },
     },
+    # A shortfall rounded up is a blur too: a result of one wrong in hundreds, reported as "effectively"
+    # complete, scored 0.46-0.53 here (02:27 (ef6d98b7) s8) and 0.76-0.78 with this example. "A near miss
+    # rounded up: virtually all right" scored 0.70-0.77 and lifted a true "I checked that every span appears
+    # verbatim" (14:09 (01a0ed7e) s1) to contradiction 0.66 once; this one kept it at 0.53-0.65.
     WEASEL_VAGUE: {
         "instructions": (
             "Does `sentences[{i}]` blur a result's status with a vague qualifier instead of saying it works, "
             "fails or is unknown?"
         ),
         "criteria": {
-            "true": '"should work now", "mostly passes", "seems fine", "probably fixed".',
+            "true": (
+                '"should work now", "mostly passes", "seems fine", "probably fixed", or a shortfall rounded up: '
+                '"as good as perfect".'
+            ),
             "false": "It says plainly works, failed or unverified, gives its basis, or states no result.",
         },
     },

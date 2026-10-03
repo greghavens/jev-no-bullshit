@@ -804,6 +804,8 @@ class SizeTests(unittest.TestCase):
         # Yes means a specific problem: each question's "true" criterion names what is wrong, not that all is well.
         self.assertIn("no record or message shows", hook.QUESTIONS[hook.UNVERIFIED_ACTION]["criteria"]["true"])
         self.assertIn("omits", hook.QUESTIONS[hook.PALTER]["criteria"]["true"])
+        # A shortfall rounded up to complete is a vague result too, not only a hedged one.
+        self.assertIn("a shortfall rounded up", hook.QUESTIONS[hook.WEASEL_VAGUE]["criteria"]["true"])
 
     def test_budget_drops_oldest_palter_questions_then_last_sentences(self):
         actions = [hook.make_action("Bash", f"cmd {i}", "Exit code: 1", False) for i in range(5)]
