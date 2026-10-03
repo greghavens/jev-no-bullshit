@@ -259,6 +259,24 @@ class TranscriptTests(unittest.TestCase):
         _, actions, _, _ = hook.parse_claude(hook.read_jsonl(str(path)))
         self.assertEqual(actions[-1]["result"], "Async agent launched successfully.\n" + note)
 
+    def test_claude_adds_a_watch_event_to_the_call_that_started_the_watch(self):
+        # 01:20 (98261e28): a Monitor event names only its task, not the call; the count the reply gave
+        # came from it, and Jev never saw it.
+        note = ("<task-notification>\n<task-id>b2m3</task-id>\n<summary>Monitor event: \"progress\"</summary>\n"
+                "<event>01:20:22 done=18 failed=0</event>\n</task-notification>")
+        extra = [
+            {"type": "assistant", "message": {"role": "assistant", "model": "claude-opus-5-5", "content": [
+                {"type": "tool_use", "id": "t5", "name": "Monitor", "input": {"description": "progress"}}]}},
+            {"type": "user", "toolUseResult": {"taskId": "b2m3"}, "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t5", "content": "Monitor started (task b2m3)."}]}},
+            {"type": "user", "message": {"role": "user", "content": note}},
+            {"type": "user", "message": {"role": "user", "content": note}},  # seen twice
+            {"type": "user", "message": {"role": "user", "content": note.replace("b2m3", "zz99")}},  # another task's
+        ]
+        path = claude_transcript(self.dir / "t.jsonl", extra=extra)
+        _, actions, _, _ = hook.parse_claude(hook.read_jsonl(str(path)))
+        self.assertEqual(actions[-1]["result"], "Monitor started (task b2m3).\n" + note)
+
     def test_conversation_keeps_the_previous_reply_when_the_reply_is_not_written_yet(self):
         # The Stop hook ran before Claude Code wrote the reply "All 19 passed." to the transcript, so the
         # last assistant message in the file was the previous reply. Dropping it as if it were the reply
@@ -1717,6 +1735,41 @@ class Round7RuleTests(unittest.TestCase):
         # A check of another file is no recheck.
         elsewhere = self.sh("python3 - <<'PY'\nassert len(json.load(open('input.json')))==25\nPY", "ok")
         self.assertFalse(hook.recheck_passed([failed, edit, elsewhere], 0))
+
+    def test_a_fix_that_deleted_some_of_the_bad_items_is_fixed(self):
+        # 11:54: the span check named three bad items; the edits requoted two and removed one found only in
+        # a neighbouring chunk, and the final check passed. Deleting fewer items than failed is a fix.
+        check = "python3 - <<'PY'\nout=[json.loads(x) for x in open('output.jsonl')]\nfor c in out: print('BAD SPAN', c['id'])\nPY"
+        failed = self.sh(check, "BAD SPAN c1 'Alpha one'\nBAD SPAN c2 'Beta two'\nBAD SPAN c3 'Gamma three'", True)
+        drop = self.sh("python3 - <<'PY'\nrows=[r for r in rows if r['span']!='Gamma three']\nPY")
+        final = self.sh(check, "25 records; spans checked")
+        self.assertTrue(hook.recheck_passed([failed, drop, final], 0))
+        # Every bad item deleted is still the 12:28 pattern.
+        alone = self.sh(check, "BAD SPAN c3 'Gamma three'", True)
+        self.assertFalse(hook.recheck_passed([alone, drop, final], 0))
+
+    def test_a_check_failure_a_later_failure_of_it_stands_for_is_shown_not_asked(self):
+        # 11:47: the span check failed four times on items later edits fixed, then a fifth time on what the
+        # reply hid. The four are shown, so the fifth keeps what it followed, but only the fifth is asked.
+        check = "python3 /tmp/make.py && python3 - <<'PY'\nout=[json.loads(x) for x in open('output.jsonl')]\nfor c in out: print('BAD SPAN', c['id'])\nPY"
+        fix = self.sh("python3 - <<'PY'\nfix('output.jsonl')\nPY", "patched")
+        actions = [self.sh(check, f"BAD SPAN e{n} 'Item {n} name'", True) for n in range(3)]
+        actions = [actions[0], fix, actions[1], fix, actions[2]]
+        self.assertTrue(hook.superseded(actions, 0))
+        self.assertFalse(hook.superseded(actions, 4))
+        # The same item failing again is no fix of it.
+        again = [actions[0], fix, self.sh(check, "BAD SPAN e0 'Item 0 name'", True)]
+        self.assertFalse(hook.superseded(again, 0))
+        marked = [{**a, "fixed_later": False} for a in actions]
+        self.assertEqual(hook.palter_targets(marked), [4])
+        self.assertEqual(hook.palter_targets(marked, shown=True), [0, 2, 4])
+        # The count of earlier failures goes on the one asked.
+        state, _ = hook.build_state("task", actions, "The output validates.")
+        questions, _, _ = hook.build_questions(state, "The output validates.")
+        self.assertEqual([q for q in questions if q.startswith(hook.PALTER)], [f"{hook.PALTER}_a4"])
+        wired = "\n".join(hook.wire_state(state)["actions"])
+        self.assertIn("Item 0 name", wired)
+        self.assertIn("earlier in the turn, /tmp/make.py failed 2 more times", wired)
 
     def test_a_passing_check_held_for_its_index_says_it_did_not_fail(self):
         # 13:24: the passing validation of all 25 records went as "[25 lines omitted]".
